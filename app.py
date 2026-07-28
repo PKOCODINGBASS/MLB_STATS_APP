@@ -177,11 +177,12 @@ def charger_donnees_equipe(annee: int = None, equipe_abbr: str = None) -> pd.Dat
         return pd.DataFrame()
 
 @st.cache_data(show_spinner=False)
-def get_scoreurs_runs_match(game_id: int, est_domicile: bool):
+def get_stats_offensives_match(game_id: int, est_domicile: bool):
     """
-    Récupère, via le boxscore statsapi d'un match, la liste des joueurs de l'équipe
-    (domicile ou extérieur) ayant marqué au moins un run lors de ce match.
-    Retourne une liste de dicts {'name': str, 'runs': int}.
+    Récupère, via le boxscore statsapi d'un match, les runs ET les home runs marqués
+    par chaque joueur de l'équipe (domicile ou extérieur) lors de ce match (un seul
+    appel au boxscore, pour éviter de doubler les requêtes réseau).
+    Retourne une liste de dicts {'name': str, 'runs': int, 'hr': int}.
     """
     if not game_id:
         return []
@@ -189,19 +190,26 @@ def get_scoreurs_runs_match(game_id: int, est_domicile: bool):
         box = statsapi.boxscore_data(int(game_id))
         batters = box.get('homeBatters', []) if est_domicile else box.get('awayBatters', [])
 
-        runs_par_joueur = {}
+        stats_par_joueur = {}
         for b in batters:
             if not b.get('personId'):
                 continue  # ligne d'en-tête du tableau, pas un joueur
             try:
                 runs = int(b.get('r', 0) or 0)
             except (ValueError, TypeError):
-                continue
-            if runs > 0:
+                runs = 0
+            try:
+                hr = int(b.get('hr', 0) or 0)
+            except (ValueError, TypeError):
+                hr = 0
+            if runs > 0 or hr > 0:
                 nom = b.get('name', 'Inconnu')
-                runs_par_joueur[nom] = runs_par_joueur.get(nom, 0) + runs
+                if nom not in stats_par_joueur:
+                    stats_par_joueur[nom] = {'runs': 0, 'hr': 0}
+                stats_par_joueur[nom]['runs'] += runs
+                stats_par_joueur[nom]['hr'] += hr
 
-        return [{'name': nom, 'runs': runs} for nom, runs in runs_par_joueur.items()]
+        return [{'name': nom, 'runs': s['runs'], 'hr': s['hr']} for nom, s in stats_par_joueur.items()]
     except Exception:
         return []
 
@@ -209,76 +217,122 @@ def get_scoreurs_runs_match(game_id: int, est_domicile: bool):
 @st.cache_data(show_spinner=False)
 def get_matchs_avec_scoreurs(annee: int, equipe_abbr: str):
     """
-    Enrichit les données de match avec la liste des scoreurs de runs par match,
-    et calcule le cumul de runs marqués par joueur sur toute la période chargée.
-    Retourne (df_matchs_enrichi, df_meilleurs_scoreurs).
+    Enrichit les données de match avec la liste des scoreurs de runs ET de home runs
+    par match, et calcule le cumul de runs / home runs marqués par joueur sur toute
+    la période chargée.
+    Retourne (df_matchs_enrichi, df_meilleurs_scoreurs_runs, df_meilleurs_scoreurs_hr).
     """
     df = charger_donnees_equipe(annee, equipe_abbr)
     if df.empty or 'game_id' not in df.columns:
-        return df, pd.DataFrame()
+        return df, pd.DataFrame(), pd.DataFrame()
 
     df = df.copy()
-    colonne_joueurs = []
+    colonne_joueurs_runs = []
+    colonne_joueurs_hr = []
     cumul_runs = {}
+    cumul_hr = {}
 
     for _, ligne in df.iterrows():
-        scoreurs = get_scoreurs_runs_match(ligne['game_id'], bool(ligne['Est_Domicile']))
-        # Chaque cellule liste "Nom (runs)" par joueur, séparés par des virgules
-        entrees = [f"{s['name']} ({s['runs']})" for s in scoreurs]
-        colonne_joueurs.append(", ".join(entrees) if entrees else "—")
-        for s in scoreurs:
-            cumul_runs[s['name']] = cumul_runs.get(s['name'], 0) + s['runs']
+        stats_batteurs = get_stats_offensives_match(ligne['game_id'], bool(ligne['Est_Domicile']))
 
-    df['Joueurs (Runs)'] = colonne_joueurs
+        # Chaque cellule liste "Nom (valeur)" par joueur, séparés par des virgules
+        entrees_runs = [f"{s['name']} ({s['runs']})" for s in stats_batteurs if s['runs'] > 0]
+        colonne_joueurs_runs.append(", ".join(entrees_runs) if entrees_runs else "—")
 
-    df_meilleurs = pd.DataFrame(
+        entrees_hr = [f"{s['name']} ({s['hr']})" for s in stats_batteurs if s['hr'] > 0]
+        colonne_joueurs_hr.append(", ".join(entrees_hr) if entrees_hr else "—")
+
+        for s in stats_batteurs:
+            if s['runs'] > 0:
+                cumul_runs[s['name']] = cumul_runs.get(s['name'], 0) + s['runs']
+            if s['hr'] > 0:
+                cumul_hr[s['name']] = cumul_hr.get(s['name'], 0) + s['hr']
+
+    df['Joueurs (Runs)'] = colonne_joueurs_runs
+    df['Joueurs (HR)'] = colonne_joueurs_hr
+
+    df_meilleurs_runs = pd.DataFrame(
         [{'Joueur': nom, 'Runs Marqués': total} for nom, total in cumul_runs.items()]
     )
-    if not df_meilleurs.empty:
-        df_meilleurs = df_meilleurs.sort_values('Runs Marqués', ascending=False).reset_index(drop=True)
+    if not df_meilleurs_runs.empty:
+        df_meilleurs_runs = df_meilleurs_runs.sort_values('Runs Marqués', ascending=False).reset_index(drop=True)
 
-    return df, df_meilleurs
+    df_meilleurs_hr = pd.DataFrame(
+        [{'Joueur': nom, 'Home Runs': total} for nom, total in cumul_hr.items()]
+    )
+    if not df_meilleurs_hr.empty:
+        df_meilleurs_hr = df_meilleurs_hr.sort_values('Home Runs', ascending=False).reset_index(drop=True)
+
+    return df, df_meilleurs_runs, df_meilleurs_hr
+
+
+def parser_cellule_joueurs(cellule: str) -> dict:
+    """
+    Parse une cellule du type "Nom (N), Nom2 (N2), ..." et retourne un dict {nom: total}.
+
+    Une cellule peut contenir plusieurs joueurs séparés par des virgules, ex:
+    "Freeman, F (2), Muncy (1), Hernández, T (1)". Certains noms MLB contiennent
+    eux-mêmes une virgule (format "Nom, Initiale"), donc on ne peut pas simplement
+    découper sur toutes les virgules : on découpe plutôt sur chaque entrée complète
+    "... (N)" (recherche non-gourmande jusqu'à la prochaine parenthèse de valeur).
+    """
+    cumul = {}
+    if not cellule or cellule == "—":
+        return cumul
+
+    entrees = re.findall(r'(.+?\(\d+\))(?:,\s*|$)', cellule)
+    for entree in entrees:
+        entree = entree.strip()
+        if not entree:
+            continue
+        correspondance = re.match(r'^(.*)\((\d+)\)$', entree)
+        if correspondance:
+            nom = correspondance.group(1).strip()
+            valeur = int(correspondance.group(2))
+        else:
+            nom = entree
+            valeur = 1
+        cumul[nom] = cumul.get(nom, 0) + valeur
+
+    return cumul
 
 
 def calculer_resume_10_derniers_matchs(df_derniers: pd.DataFrame):
     """
-    À partir des données brutes des 10 derniers matchs (colonnes 'R' et 'Joueurs (Runs)'),
-    calcule :
-      - la moyenne de runs marqués sur ces matchs
-      - le top 3 des joueurs les plus récurrents (somme des runs marqués), en gérant
+    À partir des données brutes des 10 derniers matchs (colonnes 'R', 'Joueurs (Runs)'
+    et 'Joueurs (HR)'), calcule, pour les runs ET pour les home runs :
+      - la moyenne marquée sur ces matchs
+      - le top 3 des joueurs les plus récurrents (somme sur ces matchs), en gérant
         la séparation des noms lorsqu'ils sont regroupés dans la même cellule.
-    Retourne (moyenne_runs, liste_top3) où liste_top3 est une liste de tuples (nom, total_runs).
+    Retourne (moyenne_runs, top3_runs, moyenne_hr, top3_hr), où top3_* est une liste
+    de tuples (nom, total). Les valeurs HR sont None / [] si la colonne est absente.
     """
     if df_derniers.empty or 'R' not in df_derniers.columns:
-        return None, []
+        return None, [], None, []
 
     moyenne_runs = pd.to_numeric(df_derniers['R'], errors='coerce').mean()
 
-    cumul_joueurs = {}
+    cumul_runs = {}
     for cellule in df_derniers.get('Joueurs (Runs)', []):
-        if not cellule or cellule == "—":
-            continue
-        # Une cellule peut contenir plusieurs joueurs séparés par des virgules, ex:
-        # "Freeman, F (2), Muncy (1), Hernández, T (1)". Certains noms MLB contiennent
-        # eux-mêmes une virgule (format "Nom, Initiale"), donc on ne peut pas simplement
-        # découper sur toutes les virgules : on découpe plutôt sur chaque entrée complète
-        # "... (N)" (recherche non-gourmande jusqu'à la prochaine parenthèse de run).
-        entrees = re.findall(r'(.+?\(\d+\))(?:,\s*|$)', cellule)
-        for entree in entrees:
-            entree = entree.strip()
-            if not entree:
-                continue
-            correspondance = re.match(r'^(.*)\((\d+)\)$', entree)
-            if correspondance:
-                nom = correspondance.group(1).strip()
-                runs = int(correspondance.group(2))
-            else:
-                nom = entree
-                runs = 1
-            cumul_joueurs[nom] = cumul_joueurs.get(nom, 0) + runs
+        for nom, valeur in parser_cellule_joueurs(cellule).items():
+            cumul_runs[nom] = cumul_runs.get(nom, 0) + valeur
+    top3_runs = sorted(cumul_runs.items(), key=lambda x: x[1], reverse=True)[:3]
 
-    top_3 = sorted(cumul_joueurs.items(), key=lambda x: x[1], reverse=True)[:3]
-    return moyenne_runs, top_3
+    moyenne_hr = None
+    top3_hr = []
+    if 'Joueurs (HR)' in df_derniers.columns:
+        cumul_hr = {}
+        hr_par_match = []
+        for cellule in df_derniers.get('Joueurs (HR)', []):
+            valeurs_cellule = parser_cellule_joueurs(cellule)
+            hr_par_match.append(sum(valeurs_cellule.values()))
+            for nom, valeur in valeurs_cellule.items():
+                cumul_hr[nom] = cumul_hr.get(nom, 0) + valeur
+
+        moyenne_hr = (sum(hr_par_match) / len(hr_par_match)) if hr_par_match else 0.0
+        top3_hr = sorted(cumul_hr.items(), key=lambda x: x[1], reverse=True)[:3]
+
+    return moyenne_runs, top3_runs, moyenne_hr, top3_hr
 
 # ============================================================
 # 4. LISTE DES ÉQUIPES MLB (Abréviations officielles)
@@ -339,9 +393,9 @@ with onglets[0]:
 
     equipe_abbr = extraire_abreviation_equipe(equipe_selectionnee)
 
-    # Chargement des données de matchs, enrichies avec les scoreurs de runs (boxscores statsapi)
+    # Chargement des données de matchs, enrichies avec les scoreurs de runs et de HR (boxscores statsapi)
     with st.spinner(f"Chargement des données et des boxscores pour les {EQUIPES_MLB[equipe_abbr]} ({annee})... (peut prendre un moment)"):
-        df_matchs, df_meilleurs_scoreurs = get_matchs_avec_scoreurs(annee, equipe_abbr)
+        df_matchs, df_meilleurs_scoreurs, df_meilleurs_hr = get_matchs_avec_scoreurs(annee, equipe_abbr)
 
     st.markdown("---")
     st.subheader("🔝 Classement Home Runs dans l'équipe")
@@ -478,7 +532,7 @@ with onglets[0]:
 
         st.markdown("---")
         st.subheader("📋 Derniers Matchs")
-        display_columns = ['Date', 'Équipe Domicile', 'Équipe Extérieur', 'R', 'RA', 'W/L', 'Joueurs (Runs)']
+        display_columns = ['Date', 'Équipe Domicile', 'Équipe Extérieur', 'R', 'RA', 'W/L', 'Joueurs (Runs)', 'Joueurs (HR)']
         df_recents = df_matchs.tail(10)
         df_recents = df_recents[display_columns] if all(c in df_recents.columns for c in display_columns) else df_recents
 
@@ -514,33 +568,50 @@ with onglets[0]:
             st.dataframe(df_recents, use_container_width=True, hide_index=True)
 
         # --- Résumé permanent des 10 derniers matchs (se met à jour automatiquement) ---
-        moyenne_10_derniers, top3_joueurs_10_derniers = calculer_resume_10_derniers_matchs(
+        moyenne_runs_10, top3_runs_10, moyenne_hr_10, top3_hr_10 = calculer_resume_10_derniers_matchs(
             df_matchs.tail(10)
         )
-        if moyenne_10_derniers is not None:
-            if top3_joueurs_10_derniers:
-                texte_top3 = ", ".join(
-                    f"{nom} ({runs} runs)" for nom, runs in top3_joueurs_10_derniers
-                )
-            else:
-                texte_top3 = "Aucun joueur enregistré"
+        if moyenne_runs_10 is not None:
+            texte_top3_runs = (
+                ", ".join(f"{nom} ({runs} runs)" for nom, runs in top3_runs_10)
+                if top3_runs_10 else "Aucun joueur enregistré"
+            )
+            texte_top3_hr = (
+                ", ".join(f"{nom} ({hr} HR)" for nom, hr in top3_hr_10)
+                if top3_hr_10 else "Aucun joueur enregistré"
+            )
 
-            st.markdown(f"**Moyenne de runs sur les 10 derniers matchs : {moyenne_10_derniers:.2f}**")
-            st.markdown(f"**Top 3 des joueurs les plus récurrents (runs marqués) : {texte_top3}**")
+            st.markdown(f"**Moyenne de runs sur les 10 derniers matchs : {moyenne_runs_10:.2f}**")
+            st.markdown(f"**Top 3 des joueurs les plus récurrents (runs marqués) : {texte_top3_runs}**")
+            st.markdown(f"**Moyenne de home runs sur les 10 derniers matchs : {moyenne_hr_10:.2f}**")
+            st.markdown(f"**Top 3 des joueurs les plus récurrents (home runs) : {texte_top3_hr}**")
         else:
             st.markdown("**Résumé indisponible : pas assez de données sur les 10 derniers matchs.**")
 
         st.markdown("---")
-        st.subheader("🏅 Meilleurs scoreurs de Runs")
-        st.markdown(f"Cumul des runs marqués par joueur sur la saison {annee} pour les {EQUIPES_MLB[equipe_abbr]}")
-        if not df_meilleurs_scoreurs.empty:
-            st.dataframe(
-                df_meilleurs_scoreurs,
-                use_container_width=True,
-                hide_index=True
-            )
-        else:
-            st.info("Aucune donnée de scoreurs disponible pour cette équipe/saison.")
+        col_runs, col_hr = st.columns(2)
+        with col_runs:
+            st.subheader("🏅 Meilleurs scoreurs de Runs")
+            st.markdown(f"Cumul des runs marqués par joueur sur la saison {annee}")
+            if not df_meilleurs_scoreurs.empty:
+                st.dataframe(
+                    df_meilleurs_scoreurs,
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("Aucune donnée de scoreurs disponible pour cette équipe/saison.")
+        with col_hr:
+            st.subheader("🏆 Meilleurs frappeurs de Home Runs")
+            st.markdown(f"Cumul des home runs marqués par joueur sur la saison {annee}")
+            if not df_meilleurs_hr.empty:
+                st.dataframe(
+                    df_meilleurs_hr,
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("Aucune donnée de home runs disponible pour cette équipe/saison.")
     elif not df_matchs.empty:
         st.warning("Données de runs non disponibles pour cette équipe.")
     else:
