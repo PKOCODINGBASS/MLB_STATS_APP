@@ -14,12 +14,40 @@ import streamlit as st          # Framework pour créer l'interface web
 import pandas as pd             # Manipulation de données (tableaux)
 import altair as alt            # Graphiques avancés (ligne de moyenne annotée)
 import re                       # Extraction des noms/runs dans les cellules "Joueurs (Runs)"
+import time                     # Délais/backoff entre les appels API
 from datetime import datetime   # Gestion des dates
 
 import statsapi                 # Utilisation de l'API MLB
 
 # Année courante MLB (toujours dynamique !)
 ANNEE_COURANTE = datetime.now().year
+
+
+def appeler_avec_retry(fonction, *args, tentatives: int = 3, delai_base: float = 0.5, **kwargs):
+    """
+    Exécute `fonction(*args, **kwargs)` avec un système de retry + backoff exponentiel.
+
+    Objectif : éviter que l'API MLB (statsapi) fasse "disparaître" silencieusement des
+    équipes/joueurs/matchs à cause d'une erreur réseau transitoire ou d'un rejet
+    temporaire (timeout, erreur 429/5xx, etc.). Sans cela, le code précédent utilisait
+    des `except: continue` qui avalaient l'erreur et sautaient l'équipe/le match sans
+    aucune nouvelle tentative ni message - c'est une des causes du bug "certaines
+    équipes ne se mettent pas à jour".
+
+    Le délai n'intervient qu'EN CAS D'ÉCHEC (pas avant chaque appel), donc les appels
+    réussis (le cas normal) ne sont pas ralentis. Comme la plupart des fonctions qui
+    utilisent cet appel sont elles-mêmes mises en cache par Streamlit, ce délai ne
+    s'applique de toute façon qu'au premier chargement (cache miss), pas aux reruns.
+    """
+    derniere_erreur = None
+    for tentative in range(1, tentatives + 1):
+        try:
+            return fonction(*args, **kwargs)
+        except Exception as e:
+            derniere_erreur = e
+            if tentative < tentatives:
+                time.sleep(delai_base * (2 ** (tentative - 1)))  # 0.5s, 1s, 2s, ...
+    raise derniere_erreur
 
 # ============================================================
 # 2. CONFIGURATION DE LA PAGE - Paramètres de l'application
@@ -36,10 +64,14 @@ st.set_page_config(
 
 @st.cache_data
 def get_teams_mlb_this_year(year: int = None):
-    """Récupère la liste des équipes MLB pour l'année donnée (par défaut année courante)."""
+    """
+    Récupère la liste des 30 équipes MLB pour l'année donnée (par défaut année courante).
+    Cet endpoint n'est pas paginé (il retourne toujours les 30 équipes en un seul appel),
+    mais on protège quand même l'appel avec un retry en cas d'échec réseau transitoire.
+    """
     if year is None:
         year = ANNEE_COURANTE
-    season_teams = statsapi.get('teams', {'sportIds': 1, 'season': year})
+    season_teams = appeler_avec_retry(statsapi.get, 'teams', {'sportIds': 1, 'season': year})
     data = {}
     for e in season_teams['teams']:
         data[e['abbreviation']] = e['name']
@@ -57,7 +89,8 @@ def get_team_ids_dict(year: int = None):
     if year is None:
         year = ANNEE_COURANTE
     result = {}
-    for t in statsapi.get('teams', {'sportIds': 1, 'season': year})['teams']:
+    reponse = appeler_avec_retry(statsapi.get, 'teams', {'sportIds': 1, 'season': year})
+    for t in reponse['teams']:
         result[t['abbreviation']] = t['id']
     return result
 
@@ -187,7 +220,7 @@ def get_stats_offensives_match(game_id: int, est_domicile: bool):
     if not game_id:
         return []
     try:
-        box = statsapi.boxscore_data(int(game_id))
+        box = appeler_avec_retry(statsapi.boxscore_data, int(game_id))
         batters = box.get('homeBatters', []) if est_domicile else box.get('awayBatters', [])
 
         stats_par_joueur = {}
@@ -229,11 +262,24 @@ def get_matchs_avec_scoreurs(annee: int, equipe_abbr: str):
     df = df.copy()
     colonne_joueurs_runs = []
     colonne_joueurs_hr = []
+    colonne_stats_brutes = []
     cumul_runs = {}
     cumul_hr = {}
 
     for _, ligne in df.iterrows():
         stats_batteurs = get_stats_offensives_match(ligne['game_id'], bool(ligne['Est_Domicile']))
+
+        # On conserve les données BRUTES (liste de dicts {name, runs, hr}) dans une
+        # colonne cachée, en plus de la version texte formatée pour l'affichage.
+        # Toute agrégation ultérieure (ex: résumé des 10 derniers matchs) doit
+        # additionner ces valeurs brutes directement, et NE PLUS reparser le texte
+        # formaté ci-dessous : reparser une chaîne comme "Pederson (2), Burger (1)"
+        # est fragile (virgules dans les noms au format "Nom, Initiale", suffixe de
+        # désambiguïsation qui peut varier d'un match à l'autre pour un même
+        # joueur, etc.) et peut produire des totaux différents du contenu réel du
+        # tableau. Garder les données brutes garantit que les totaux affichés
+        # ailleurs correspondent TOUJOURS exactement à ce tableau.
+        colonne_stats_brutes.append(stats_batteurs)
 
         # Chaque cellule liste "Nom (valeur)" par joueur, séparés par des virgules
         entrees_runs = [f"{s['name']} ({s['runs']})" for s in stats_batteurs if s['runs'] > 0]
@@ -250,6 +296,7 @@ def get_matchs_avec_scoreurs(annee: int, equipe_abbr: str):
 
     df['Joueurs (Runs)'] = colonne_joueurs_runs
     df['Joueurs (HR)'] = colonne_joueurs_hr
+    df['_offensive_stats'] = colonne_stats_brutes  # colonne interne (non affichée) : liste de dicts {name, runs, hr}
 
     df_meilleurs_runs = pd.DataFrame(
         [{'Joueur': nom, 'Runs Marqués': total} for nom, total in cumul_runs.items()]
@@ -299,40 +346,265 @@ def parser_cellule_joueurs(cellule: str) -> dict:
 
 def calculer_resume_10_derniers_matchs(df_derniers: pd.DataFrame):
     """
-    À partir des données brutes des 10 derniers matchs (colonnes 'R', 'Joueurs (Runs)'
-    et 'Joueurs (HR)'), calcule, pour les runs ET pour les home runs :
-      - la moyenne marquée sur ces matchs
-      - le top 3 des joueurs les plus récurrents (somme sur ces matchs), en gérant
-        la séparation des noms lorsqu'ils sont regroupés dans la même cellule.
-    Retourne (moyenne_runs, top3_runs, moyenne_hr, top3_hr), où top3_* est une liste
-    de tuples (nom, total). Les valeurs HR sont None / [] si la colonne est absente.
+    À partir des données des 10 derniers matchs, calcule, pour les runs ET pour les
+    home runs : la moyenne marquée sur ces matchs, le cumul EXACT par joueur, et le
+    top 3 des joueurs les plus récurrents.
+
+    --- CORRECTIF (totaux par joueur incorrects) ---
+    Auparavant, cette fonction reparsait les colonnes texte déjà formatées
+    ('Joueurs (Runs)' / 'Joueurs (HR)', ex: "Pederson (2), Burger (1)") avec une
+    regex pour reconstituer les totaux. Cette approche est fragile - un même nom
+    peut apparaître avec un suffixe de désambiguïsation différent d'un match à
+    l'autre ("Duran" vs "Duran, E"), ce qui pouvait faire diverger silencieusement
+    la somme calculée du contenu réel du tableau affiché.
+
+    La fonction additionne maintenant DIRECTEMENT les statistiques brutes par match
+    (colonne interne '_offensive_stats', une liste de dicts {name, runs, hr} par
+    match - la même source que celle utilisée pour construire les colonnes
+    affichées), sans repasser par aucun texte formaté. Le total obtenu correspond
+    donc toujours exactement à la somme des valeurs visibles dans le tableau des
+    10 derniers matchs. Le parsing par regex (`parser_cellule_joueurs`) n'est
+    conservé qu'en repli, si jamais la colonne brute n'est pas disponible.
+
+    Retourne (moyenne_runs, top3_runs, moyenne_hr, top3_hr, cumul_runs, cumul_hr) :
+      - top3_* est une liste de tuples (nom, total) limitée aux 3 plus hauts totaux.
+      - cumul_runs / cumul_hr sont les dictionnaires COMPLETS {nom: total} (non
+        tronqués), à utiliser dès qu'on a besoin du total exact d'un joueur qui
+        n'est pas forcément dans le top 3 de l'AUTRE catégorie.
     """
     if df_derniers.empty or 'R' not in df_derniers.columns:
-        return None, [], None, []
+        return None, [], None, [], {}, {}
 
     moyenne_runs = pd.to_numeric(df_derniers['R'], errors='coerce').mean()
 
+    a_stats_brutes = '_offensive_stats' in df_derniers.columns
+    a_colonne_hr = 'Joueurs (HR)' in df_derniers.columns
+
     cumul_runs = {}
-    for cellule in df_derniers.get('Joueurs (Runs)', []):
-        for nom, valeur in parser_cellule_joueurs(cellule).items():
-            cumul_runs[nom] = cumul_runs.get(nom, 0) + valeur
+    cumul_hr = {}
+
+    if a_stats_brutes:
+        for stats_match in df_derniers['_offensive_stats']:
+            for s in (stats_match or []):
+                if s.get('runs', 0) > 0:
+                    cumul_runs[s['name']] = cumul_runs.get(s['name'], 0) + s['runs']
+                if s.get('hr', 0) > 0:
+                    cumul_hr[s['name']] = cumul_hr.get(s['name'], 0) + s['hr']
+    else:
+        # Repli (rétro-compatibilité) : si la colonne brute n'existe pas, on
+        # retombe sur le parsing texte, moins fiable mais fonctionnel.
+        for cellule in df_derniers.get('Joueurs (Runs)', []):
+            for nom, valeur in parser_cellule_joueurs(cellule).items():
+                cumul_runs[nom] = cumul_runs.get(nom, 0) + valeur
+        if a_colonne_hr:
+            for cellule in df_derniers['Joueurs (HR)']:
+                for nom, valeur in parser_cellule_joueurs(cellule).items():
+                    cumul_hr[nom] = cumul_hr.get(nom, 0) + valeur
+
     top3_runs = sorted(cumul_runs.items(), key=lambda x: x[1], reverse=True)[:3]
 
     moyenne_hr = None
     top3_hr = []
-    if 'Joueurs (HR)' in df_derniers.columns:
-        cumul_hr = {}
-        hr_par_match = []
-        for cellule in df_derniers.get('Joueurs (HR)', []):
-            valeurs_cellule = parser_cellule_joueurs(cellule)
-            hr_par_match.append(sum(valeurs_cellule.values()))
-            for nom, valeur in valeurs_cellule.items():
-                cumul_hr[nom] = cumul_hr.get(nom, 0) + valeur
-
-        moyenne_hr = (sum(hr_par_match) / len(hr_par_match)) if hr_par_match else 0.0
+    if a_stats_brutes or a_colonne_hr:
+        nb_matchs = len(df_derniers)
+        moyenne_hr = (sum(cumul_hr.values()) / nb_matchs) if nb_matchs else 0.0
         top3_hr = sorted(cumul_hr.items(), key=lambda x: x[1], reverse=True)[:3]
 
-    return moyenne_runs, top3_runs, moyenne_hr, top3_hr
+    return moyenne_runs, top3_runs, moyenne_hr, top3_hr, cumul_runs, cumul_hr
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def obtenir_match_du_jour(team_id: int):
+    """
+    Cherche, dans le calendrier MLB du jour (date système), un match impliquant
+    l'équipe donnée. Retourne un dict avec l'adversaire, le statut domicile/extérieur,
+    les lanceurs partants prévus (des deux côtés), le stade et l'heure, ou None si
+    aucun match n'est prévu aujourd'hui pour cette équipe.
+
+    Le cache utilise un `ttl=300` (5 minutes) - contrairement aux autres fonctions
+    de chargement, ces données (lanceur probable, statut du match) peuvent changer
+    en cours de journée, donc on ne les garde pas en cache indéfiniment.
+    """
+    if not team_id:
+        return None
+    aujourdhui = datetime.now().strftime('%Y-%m-%d')
+    try:
+        matchs_du_jour = appeler_avec_retry(statsapi.schedule, date=aujourdhui, team=team_id)
+    except Exception:
+        return None
+    if not matchs_du_jour:
+        return None
+
+    match = matchs_du_jour[0]  # cas des double programmes (doubleheader) : on retient le 1er match
+    est_domicile = (match.get('home_id') == team_id)
+
+    return {
+        'adversaire': match.get('away_name') if est_domicile else match.get('home_name'),
+        'est_domicile': est_domicile,
+        'lanceur_notre_equipe': match.get('home_probable_pitcher') if est_domicile else match.get('away_probable_pitcher'),
+        'lanceur_adverse': match.get('away_probable_pitcher') if est_domicile else match.get('home_probable_pitcher'),
+        'heure': match.get('game_datetime'),
+        'statut': match.get('status'),
+        'venue': match.get('venue_name'),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def obtenir_stats_lanceur(nom_lanceur: str, annee: int):
+    """
+    Recherche un lanceur par son nom complet (tel que renvoyé par le calendrier du
+    jour) et retourne ses statistiques de la saison en cours (ERA, WHIP, runs
+    alloués, HR alloués, HR/9, matchs comme titulaire) via statsapi.
+    Retourne None si le nom est vide, introuvable, ou si les stats sont absentes
+    (ex: lanceur de relève sans départ, débutant sans historique, etc.).
+    """
+    if not nom_lanceur:
+        return None
+    try:
+        resultats = appeler_avec_retry(statsapi.lookup_player, nom_lanceur)
+        if not resultats:
+            return None
+        player_id = resultats[0]['id']
+        stats_joueur = appeler_avec_retry(
+            statsapi.player_stat_data, player_id, group="pitching", type="season"
+        )
+        for bloc in stats_joueur.get('stats', []):
+            if bloc.get('type') == 'season' and bloc.get('group') == 'pitching':
+                s = bloc.get('stats', {})
+                if not s.get('era'):
+                    return None
+                return {
+                    'nom': resultats[0].get('fullName', nom_lanceur),
+                    'era': float(s.get('era') or 0),
+                    'whip': float(s.get('whip') or 0),
+                    'runs_alloues': int(s.get('runs') or 0),
+                    'hr_alloues': int(s.get('homeRuns') or 0),
+                    'hr_par_9': float(s.get('homeRunsPer9') or 0),
+                    'matchs_titulaire': int(s.get('gamesStarted') or s.get('gamesPitched') or 0),
+                }
+        return None
+    except Exception:
+        return None
+
+
+def predire_runs_match(moyenne_runs_equipe, moyenne_ra_equipe, stats_lanceur_adverse):
+    """
+    Estimation heuristique (PAS un modèle statistique validé) du nombre de runs que
+    l'équipe sélectionnée pourrait marquer aujourd'hui, ainsi que du total de runs
+    du match, en croisant :
+      - la moyenne de runs marqués par l'équipe sur ses 10 derniers matchs,
+      - les stats du lanceur partant adverse (ERA, WHIP) - un ERA/WHIP élevé
+        indique un lanceur plus "battable", donc on augmente l'estimation,
+      - la moyenne de runs concédés par l'équipe sur ses 10 derniers matchs,
+        utilisée comme proxy raisonnable de l'attaque adverse (faute de connaître
+        le lanceur partant de notre propre équipe, hors périmètre de la demande).
+    Retourne un dict {'runs_equipe', 'total_match', 'confiance'} ou None si aucune
+    donnée de forme récente n'est disponible pour l'équipe.
+    """
+    if moyenne_runs_equipe is None:
+        return None
+
+    if stats_lanceur_adverse is not None and stats_lanceur_adverse.get('era', 0) > 0:
+        era = stats_lanceur_adverse['era']
+        whip = stats_lanceur_adverse['whip']
+        # Moyenne pondérée entre la forme offensive de l'équipe et la vulnérabilité du lanceur adverse
+        runs_estimes_equipe = (moyenne_runs_equipe * 0.55) + (era * 0.45)
+        # Un WHIP élevé (plus de coureurs sur les buts) augmente l'estimation, un WHIP très bas la réduit
+        if whip >= 1.35:
+            runs_estimes_equipe *= 1.12
+        elif whip <= 1.05:
+            runs_estimes_equipe *= 0.90
+        confiance = "Élevée" if stats_lanceur_adverse.get('matchs_titulaire', 0) >= 8 else "Moyenne"
+    else:
+        # Pas de stats fiables sur le lanceur adverse -> on se base uniquement sur la forme offensive de l'équipe
+        runs_estimes_equipe = moyenne_runs_equipe
+        confiance = "Faible"
+
+    runs_estimes_adverse = moyenne_ra_equipe if moyenne_ra_equipe is not None and pd.notna(moyenne_ra_equipe) else moyenne_runs_equipe
+    total_runs_estime = runs_estimes_equipe + runs_estimes_adverse
+
+    return {
+        'runs_equipe': round(runs_estimes_equipe, 1),
+        'total_match': round(total_runs_estime, 1),
+        'confiance': confiance,
+    }
+
+
+def predire_joueurs_du_jour(cumul_runs_10, cumul_hr_10, stats_lanceur_adverse, top_n: int = 3):
+    """
+    Construit une liste de joueurs "en forme" et calcule pour chacun un indice de
+    confiance (0-100) croisant leur activité récente avec les faiblesses du
+    lanceur adverse du jour (ERA, WHIP, HR/9 encaissés).
+
+    --- CORRECTIF (un joueur pouvait afficher "0 run" alors qu'il en avait marqué) ---
+    Cette fonction recevait auparavant uniquement les listes TOP 3 (top3_runs_10 /
+    top3_hr_10, déjà tronquées à 3 éléments chacune). Un joueur présent dans le
+    top 3 des HR mais pas dans le top 3 des runs (car d'autres joueurs avaient
+    plus de runs) se voyait donc afficher "0 run" même s'il avait réellement
+    marqué plusieurs runs sur les 10 derniers matchs.
+
+    La fonction prend maintenant directement `cumul_runs_10` / `cumul_hr_10`, les
+    dictionnaires COMPLETS (non tronqués) de tous les joueurs. On sélectionne les
+    candidats "en forme" via le top 3 de chaque catégorie (comme avant), mais on
+    va chercher leur total EXACT (runs ET HR) dans ces dictionnaires complets, ce
+    qui garantit un affichage fidèle au tableau des 10 derniers matchs.
+
+    Retourne une liste de dicts triée par indice décroissant, limitée à `top_n`.
+    """
+    cumul_runs_10 = cumul_runs_10 or {}
+    cumul_hr_10 = cumul_hr_10 or {}
+
+    if not cumul_runs_10 and not cumul_hr_10:
+        return []
+
+    # Candidats "en forme" = présents dans le top 3 d'AU MOINS une des deux
+    # catégories (runs ou HR) - mais leur total affiché sera toujours le total
+    # RÉEL (les deux dictionnaires complets), jamais une valeur tronquée à 0.
+    top3_noms_runs = {nom for nom, _ in sorted(cumul_runs_10.items(), key=lambda x: x[1], reverse=True)[:3]}
+    top3_noms_hr = {nom for nom, _ in sorted(cumul_hr_10.items(), key=lambda x: x[1], reverse=True)[:3]}
+    candidats = top3_noms_runs | top3_noms_hr
+
+    if not candidats:
+        return []
+
+    # Facteur de vulnérabilité du lanceur adverse : plus son ERA/WHIP/HR-par-9 sont
+    # élevés, plus il est jugé "battable" (facteur > 1) ; un lanceur dominant réduit
+    # le facteur (< 1). Le facteur est borné pour rester réaliste (pas d'emballement).
+    facteur_adverse = 1.0
+    if stats_lanceur_adverse is not None and stats_lanceur_adverse.get('era', 0) > 0:
+        era = stats_lanceur_adverse['era']
+        whip = stats_lanceur_adverse['whip']
+        hr9 = stats_lanceur_adverse['hr_par_9']
+        facteur_adverse += max(0, (era - 4.0)) * 0.08
+        facteur_adverse += max(0, (whip - 1.20)) * 0.5
+        facteur_adverse += max(0, (hr9 - 1.0)) * 0.15
+        facteur_adverse = max(0.7, min(facteur_adverse, 1.6))
+
+    resultats = []
+    for nom in candidats:
+        runs_10 = cumul_runs_10.get(nom, 0)
+        hr_10 = cumul_hr_10.get(nom, 0)
+        indice_brut = (runs_10 * 8) + (hr_10 * 20)  # le HR pèse plus car plus rare qu'un run
+        indice = min(95, round(indice_brut * facteur_adverse))
+        if indice <= 0:
+            continue
+        if indice >= 65:
+            confiance = "Élevée"
+        elif indice >= 35:
+            confiance = "Moyenne"
+        else:
+            confiance = "Faible"
+        resultats.append({
+            'nom': nom,
+            'runs_10': runs_10,
+            'hr_10': hr_10,
+            'indice': indice,
+            'confiance': confiance,
+        })
+
+    resultats = sorted(resultats, key=lambda x: x['indice'], reverse=True)
+    return resultats[:top_n]
+
 
 # ============================================================
 # 4. LISTE DES ÉQUIPES MLB (Abréviations officielles)
@@ -343,7 +615,7 @@ def calculer_resume_10_derniers_matchs(df_derniers: pd.DataFrame):
 # ============================================================
 
 st.title("⚾ Analyse Statistiques MLB")
-st.markdown("### Explorez les runs, les sluggers récurrents et les tendances W/L")
+st.markdown("### Explorez les runs, les prédictions du jour et les tendances W/L")
 
 # Sidebar pour les paramètres globaux
 with st.sidebar:
@@ -357,10 +629,9 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Légende des abréviations:**")
     st.markdown("""
+    - **R** : Runs (Points marqués)
+    - **RA** : Runs Against (Points concédés)
     - **HR** : Home Runs (Coup de circuit)
-    - **SLG** : Slugging Percentage (Pourcentage de puissance)
-    - **RBI** : Runs Batted In (Points produits)
-    - **AVG** : Batting Average (Moyenne de frappe)
     - **W** : Wins (Victoires)
     - **L** : Losses (Défaites)
     """)
@@ -373,7 +644,7 @@ EQUIPES_MLB = get_teams_mlb_this_year(annee)
 # ============================================================
 onglets = st.tabs([
     "📊 Analyse par Équipe",
-    "⚡ Sluggers Récurrents"
+    "🔮 Prédictions du jour"
 ])
 
 # --------------------------------------------------------------
@@ -397,6 +668,12 @@ with onglets[0]:
     with st.spinner(f"Chargement des données et des boxscores pour les {EQUIPES_MLB[equipe_abbr]} ({annee})... (peut prendre un moment)"):
         df_matchs, df_meilleurs_scoreurs, df_meilleurs_hr = get_matchs_avec_scoreurs(annee, equipe_abbr)
 
+    # Valeurs par défaut du résumé des 10 derniers matchs : elles sont réaffectées plus bas
+    # si les données sont disponibles, mais doivent exister dès maintenant car l'onglet
+    # "Prédictions du jour" (exécuté après celui-ci) les réutilise.
+    moyenne_runs_10, top3_runs_10, moyenne_hr_10, top3_hr_10 = None, [], None, []
+    cumul_runs_10, cumul_hr_10 = {}, {}
+
     st.markdown("---")
     st.subheader("🔝 Classement Home Runs dans l'équipe")
 
@@ -411,13 +688,17 @@ with onglets[0]:
             if not team_id:
                 return []
 
-            roster_data = statsapi.get('team_roster', {'teamId': team_id, 'season': annee})
+            roster_data = appeler_avec_retry(
+                statsapi.get, 'team_roster', {'teamId': team_id, 'season': annee}
+            )
 
             for item in roster_data.get('roster', []):
                 player_id = item['person']['id']
                 nom = item['person']['fullName']
 
-                player_stats = statsapi.player_stat_data(player_id, group="hitting", type="season")
+                player_stats = appeler_avec_retry(
+                    statsapi.player_stat_data, player_id, group="hitting", type="season"
+                )
 
                 home_runs = 0
                 for stat_item in player_stats.get('stats', []):
@@ -568,7 +849,7 @@ with onglets[0]:
             st.dataframe(df_recents, use_container_width=True, hide_index=True)
 
         # --- Résumé permanent des 10 derniers matchs (se met à jour automatiquement) ---
-        moyenne_runs_10, top3_runs_10, moyenne_hr_10, top3_hr_10 = calculer_resume_10_derniers_matchs(
+        moyenne_runs_10, top3_runs_10, moyenne_hr_10, top3_hr_10, cumul_runs_10, cumul_hr_10 = calculer_resume_10_derniers_matchs(
             df_matchs.tail(10)
         )
         if moyenne_runs_10 is not None:
@@ -618,165 +899,130 @@ with onglets[0]:
         st.error("Impossible de charger les données. Vérifiez l'abréviation de l'équipe.")
 
 # --------------------------------------------------------------
-# ONGLET 2: SLUGGERS RÉCURRENTS
+# ONGLET 2: PRÉDICTIONS DU JOUR
 # --------------------------------------------------------------
 with onglets[1]:
-    st.header("⚡ Analyse des Sluggers Récurrents")
-    st.markdown("Les frappeurs de puissance avec les meilleures statistiques de la ligue")
+    st.header("🔮 Prédictions du jour")
+    st.markdown(f"Prédiction du match du jour pour les **{EQUIPES_MLB.get(equipe_abbr, equipe_abbr)}**")
+    st.caption(
+        "⚠️ Estimations statistiques basées sur les tendances récentes de l'équipe et les stats du "
+        "lanceur adverse. Ce ne sont pas des garanties de résultat : à utiliser uniquement à titre "
+        "informatif, avec discernement si vous vous en servez pour parier."
+    )
 
-    # Chargement des statistiques de frappe par statsapi
-    @st.cache_data
-    def charger_statistiques_frappe_joueurs(annee: int = None) -> pd.DataFrame:
-        """Récupère les stats des frappeurs MLB sur la saison demandée (défaut = année courante)."""
-        if annee is None:
-            annee = ANNEE_COURANTE
-        try:
-            equipes = get_teams_mlb_this_year(annee)
-            team_ids = get_team_ids_dict(annee)
-            all_batters = []
-            for abbr, nom in equipes.items():
-                tid = team_ids.get(abbr)
-                if tid is None:
-                    continue
-
-                try:
-                    stats = statsapi.team_year_batting(tid, season=annee, splits=False)
-                    for joueur in stats:
-                        nom_joueur = joueur.get('playerFullName', '')
-                        if not nom_joueur:
-                            continue
-                        ab = joueur.get('atBats', 0)
-                        try:
-                            ab = int(ab)
-                        except Exception:
-                            ab = 0
-                        try:
-                            record = {
-                                "Name": nom_joueur,
-                                "Team": abbr,
-                                "HR": int(joueur.get('homeRuns', 0) or 0),
-                                "AVG": float(joueur.get('avg', 0) or 0),
-                                "SLG": float(joueur.get('slg', 0) or 0),
-                                "RBI": int(joueur.get('rbi', 0) or 0),
-                                "AB": ab,
-                                "H": int(joueur.get('hits', 0) or 0)
-                            }
-                        except Exception:
-                            continue
-                        all_batters.append(record)
-                except Exception:
-                    continue
-
-            df = pd.DataFrame(all_batters)
-            if df.empty:
-                return pd.DataFrame()
-            for field in ['HR', 'RBI', 'AB', 'H']:
-                df[field] = pd.to_numeric(df[field], errors='coerce')
-            for field in ['AVG', 'SLG']:
-                df[field] = pd.to_numeric(df[field], errors='coerce')
-            df = df.dropna(subset=['Name', 'AB', 'HR', 'SLG'])
-            df = df[df['AB'] > 0]
-
-            return df
-        except Exception as e:
-            st.error(f"Erreur lors du chargement des statistiques de frappe : {e}")
-            return pd.DataFrame()
-
-    with st.spinner(f"Chargement des statistiques de frappe pour la saison {annee}..."):
-        df_stats = charger_statistiques_frappe_joueurs(annee)
-
-    if not df_stats.empty:
-        if 'AB' in df_stats.columns:
-            df_stats = df_stats[df_stats['AB'] >= 100]
-
-        sous_onglets = st.tabs(["🏆 Top Home Runs", "💪 Top Slugging", "📊 Classement Complet"])
-
-        # Sous-onglet 1: Top Home Runs
-        with sous_onglets[0]:
-            st.subheader("🏆 Top 15 des Frappeurs de Circuits")
-            if 'HR' in df_stats.columns:
-                top_hr = df_stats.nlargest(15, 'HR')[['Name', 'Team', 'HR', 'RBI', 'AVG', 'SLG']]
-                import plotly.express as px
-                fig_hr = px.bar(
-                    top_hr.head(10),
-                    x='Name',
-                    y='HR',
-                    title=f"Top 10 Frappeurs de Circuits - Saison {annee}",
-                    color='HR',
-                    color_continuous_scale='Reds',
-                    labels={'Name': 'Joueur', 'HR': 'Home Runs'}
-                )
-
-                fig_hr.update_layout(
-                    template="plotly_white",
-                    height=400,
-                    xaxis_title="Joueur",
-                    yaxis_title="Nombre de Home Runs"
-                )
-                fig_hr.update_xaxes(tickangle=45)
-                st.plotly_chart(fig_hr, use_container_width=True)
-                st.markdown("---")
-                st.dataframe(top_hr, use_container_width=True, hide_index=True)
-
-        # Sous-onglet 2: Top Slugging
-        with sous_onglets[1]:
-            st.subheader("💪 Top 15 des Frappeurs de Puissance (Slugging)")
-            if 'SLG' in df_stats.columns:
-                top_slg = df_stats.nlargest(15, 'SLG')[['Name', 'Team', 'SLG', 'HR', 'AVG', 'AB']]
-                top_slg_display = top_slg.copy()
-                top_slg_display['SLG_%'] = (top_slg_display['SLG'] * 100).round(1)
-                import plotly.express as px
-                fig_slg = px.bar(
-                    top_slg.head(10),
-                    x='Name',
-                    y='SLG',
-                    title=f"Top 10 Slugging Percentage - Saison {annee}",
-                    color='SLG',
-                    color_continuous_scale='Blues',
-                    labels={'Name': 'Joueur', 'SLG': 'Slugging %'}
-                )
-
-                fig_slg.update_layout(
-                    template="plotly_white",
-                    height=400,
-                    xaxis_title="Joueur",
-                    yaxis_title="Slugging Percentage"
-                )
-                fig_slg.update_xaxes(tickangle=45)
-                st.plotly_chart(fig_slg, use_container_width=True)
-                st.markdown("---")
-                st.dataframe(top_slg_display[['Name', 'Team', 'SLG_%', 'HR', 'AVG']].rename(
-                    columns={'SLG_%': 'SLG (%)', 'AVG': 'Avg'}
-                ), use_container_width=True, hide_index=True)
-
-        # Sous-onglet 3: Classement Complet
-        with sous_onglets[2]:
-            st.subheader("📊 Classement Complet des Frappeurs")
-
-            df_classement = df_stats[['Name', 'Team', 'HR', 'SLG', 'RBI', 'AVG', 'AB']].copy()
-            if 'SLG' in df_classement.columns:
-                df_classement['SLG_%'] = (df_classement['SLG'] * 100).round(1)
-            if 'AVG' in df_classement.columns:
-                df_classement['AVG'] = df_classement['AVG'].round(3)
-            df_classement = df_classement.rename(columns={
-                'SLG_%': 'SLG (%)',
-                'AB': 'Passages'
-            })
-
-            st.dataframe(
-                df_classement.sort_values('HR', ascending=False),
-                use_container_width=True,
-                hide_index=True
-            )
-            csv = df_classement.sort_values('HR', ascending=False).to_csv(index=False)
-            st.download_button(
-                label="📥 Télécharger les données (CSV)",
-                data=csv,
-                file_name=f"stats_frappeurs_mlb_{annee}.csv",
-                mime="text/csv"
-            )
+    if annee != ANNEE_COURANTE:
+        st.info(
+            f"Les prédictions du jour ne sont disponibles que pour la saison en cours "
+            f"({ANNEE_COURANTE}). Sélectionnez {ANNEE_COURANTE} dans le menu de gauche pour "
+            f"voir la prédiction du match d'aujourd'hui."
+        )
     else:
-        st.error("Impossible de charger les statistiques de frappe.")
+        team_ids_pred = get_team_ids_dict(annee)
+        team_id_selectionne = team_ids_pred.get(equipe_abbr)
+
+        with st.spinner("Recherche du match du jour..."):
+            match_du_jour = obtenir_match_du_jour(team_id_selectionne)
+
+        if not match_du_jour:
+            st.info(f"Aucun match n'est prévu aujourd'hui pour les {EQUIPES_MLB.get(equipe_abbr, equipe_abbr)}.")
+        else:
+            lieu = "à domicile" if match_du_jour['est_domicile'] else "à l'extérieur"
+            st.subheader(
+                f"🆚 {EQUIPES_MLB.get(equipe_abbr, equipe_abbr)} {lieu} contre {match_du_jour['adversaire']}"
+            )
+
+            col_venue, col_heure, col_statut = st.columns(3)
+            with col_venue:
+                st.metric("Stade", match_du_jour['venue'] or "—")
+            with col_heure:
+                heure_aff = "—"
+                if match_du_jour['heure']:
+                    try:
+                        heure_aff = datetime.fromisoformat(
+                            match_du_jour['heure'].replace('Z', '+00:00')
+                        ).strftime('%H:%M UTC')
+                    except Exception:
+                        heure_aff = match_du_jour['heure']
+                st.metric("Heure", heure_aff)
+            with col_statut:
+                st.metric("Statut", match_du_jour['statut'] or "—")
+
+            st.markdown("#### ⚾ Lanceurs partants prévus")
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                st.markdown(f"**{EQUIPES_MLB.get(equipe_abbr, equipe_abbr)}**")
+                st.markdown(f"### {match_du_jour['lanceur_notre_equipe'] or 'Non annoncé'}")
+            with col_p2:
+                st.markdown(f"**{match_du_jour['adversaire']}**")
+                st.markdown(f"### {match_du_jour['lanceur_adverse'] or 'Non annoncé'}")
+
+            with st.spinner("Analyse des statistiques du lanceur adverse..."):
+                stats_lanceur_adverse = obtenir_stats_lanceur(match_du_jour['lanceur_adverse'], annee)
+
+            if stats_lanceur_adverse:
+                st.caption(
+                    f"Stats saison {annee} de {stats_lanceur_adverse['nom']} : "
+                    f"ERA {stats_lanceur_adverse['era']:.2f} · WHIP {stats_lanceur_adverse['whip']:.2f} · "
+                    f"{stats_lanceur_adverse['hr_alloues']} HR alloués · "
+                    f"{stats_lanceur_adverse['matchs_titulaire']} départs"
+                )
+            elif match_du_jour['lanceur_adverse']:
+                st.caption("Statistiques du lanceur adverse indisponibles pour le moment.")
+
+            st.markdown("---")
+            st.subheader("📊 Module de prédiction des Runs")
+
+            if moyenne_runs_10 is None:
+                st.info("Pas assez de données récentes pour estimer les runs de cette équipe.")
+            else:
+                moyenne_ra_10 = pd.to_numeric(
+                    df_matchs.tail(10).get('RA', pd.Series(dtype=float)), errors='coerce'
+                ).mean()
+                prediction_runs = predire_runs_match(moyenne_runs_10, moyenne_ra_10, stats_lanceur_adverse)
+
+                col_pred1, col_pred2, col_pred3 = st.columns(3)
+                with col_pred1:
+                    st.metric(
+                        f"Runs estimés — {equipe_abbr}",
+                        f"{prediction_runs['runs_equipe']}"
+                    )
+                with col_pred2:
+                    st.metric("Total de runs estimé (match)", f"{prediction_runs['total_match']}")
+                with col_pred3:
+                    st.metric("Indice de confiance", prediction_runs['confiance'])
+
+                st.caption(
+                    f"Basé sur une moyenne de {moyenne_runs_10:.2f} runs/match et "
+                    f"{moyenne_ra_10:.2f} runs concédés/match sur les 10 derniers matchs, "
+                    + (
+                        f"croisée avec les stats du lanceur adverse ({stats_lanceur_adverse['nom']})."
+                        if stats_lanceur_adverse
+                        else "en l'absence de stats fiables sur le lanceur adverse."
+                    )
+                )
+
+            st.markdown("---")
+            st.subheader("🎯 Module de prédiction des Joueurs (HR / Runs)")
+
+            joueurs_a_surveiller = predire_joueurs_du_jour(
+                cumul_runs_10, cumul_hr_10, stats_lanceur_adverse, top_n=3
+            )
+
+            if not joueurs_a_surveiller:
+                st.info(
+                    "Pas assez de données de forme récente (runs/HR sur les 10 derniers matchs) "
+                    "pour identifier des joueurs à surveiller aujourd'hui."
+                )
+            else:
+                cols_joueurs = st.columns(len(joueurs_a_surveiller))
+                for idx, joueur in enumerate(joueurs_a_surveiller):
+                    with cols_joueurs[idx]:
+                        st.markdown(f"**{joueur['nom']}**")
+                        st.progress(joueur['indice'] / 100)
+                        st.markdown(f"Indice de confiance : **{joueur['confiance']}** ({joueur['indice']}/100)")
+                        st.caption(
+                            f"{joueur['runs_10']} run(s) et {joueur['hr_10']} HR sur les 10 derniers matchs"
+                        )
 
 # ============================================================
 # 7. PIED DE PAGE
