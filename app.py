@@ -16,11 +16,21 @@ import altair as alt            # Graphiques avancés (ligne de moyenne annotée
 import re                       # Extraction des noms/runs dans les cellules "Joueurs (Runs)"
 import time                     # Délais/backoff entre les appels API
 from datetime import datetime   # Gestion des dates
+from zoneinfo import ZoneInfo   # Gestion des fuseaux horaires (heure US <-> heure française)
 
 import statsapi                 # Utilisation de l'API MLB
 
-# Année courante MLB (toujours dynamique !)
-ANNEE_COURANTE = datetime.now().year
+# Fuseaux horaires utilisés pour l'affichage double fuseau des heures de match :
+# - TZ_US_EASTERN : heure de référence MLB (Heure de l'Est US). `ZoneInfo` bascule
+#   automatiquement entre EST (hiver, UTC-5) et EDT (été, UTC-4) selon la date.
+# - TZ_PARIS : heure française, pour savoir à quelle heure (locale) suivre le match.
+TZ_US_EASTERN = ZoneInfo("America/New_York")
+TZ_PARIS = ZoneInfo("Europe/Paris")
+
+# Année MLB courante, basée sur la date du jour aux USA (heure de l'Est), pas sur
+# l'heure du serveur/de l'utilisateur : la saison MLB est définie en heure US, donc
+# utiliser une autre référence pourrait décaler l'année d'un jour près du Nouvel An.
+ANNEE_COURANTE = datetime.now(TZ_US_EASTERN).year
 
 
 def appeler_avec_retry(fonction, *args, tentatives: int = 3, delai_base: float = 0.5, **kwargs):
@@ -416,10 +426,21 @@ def calculer_resume_10_derniers_matchs(df_derniers: pd.DataFrame):
 @st.cache_data(show_spinner=False, ttl=300)
 def obtenir_match_du_jour(team_id: int):
     """
-    Cherche, dans le calendrier MLB du jour (date système), un match impliquant
-    l'équipe donnée. Retourne un dict avec l'adversaire, le statut domicile/extérieur,
-    les lanceurs partants prévus (des deux côtés), le stade et l'heure, ou None si
-    aucun match n'est prévu aujourd'hui pour cette équipe.
+    Cherche, dans le calendrier MLB du jour (date du jour AUX USA, heure de l'Est),
+    un match impliquant l'équipe donnée. Retourne un dict avec l'adversaire, le
+    statut domicile/extérieur, les lanceurs partants prévus (des deux côtés), le
+    stade, ainsi que l'heure du match dans DEUX fuseaux horaires (US Eastern ET
+    France), ou None si aucun match n'est prévu aujourd'hui (heure US) pour cette
+    équipe.
+
+    --- CORRECTIF (jour de référence) ---
+    On détermine "aujourd'hui" avec `datetime.now(TZ_US_EASTERN)` et non plus avec
+    l'heure système brute. La saison MLB (et l'endpoint `schedule` de statsapi) est
+    organisée selon le jour calendaire AMÉRICAIN : pour un utilisateur en France,
+    l'heure locale peut déjà être "demain" (ex: 1h du matin en France = encore
+    19h la veille sur la côte Est) - utiliser l'heure locale du serveur/utilisateur
+    aurait pu faire chercher le mauvais jour de match, ou n'en trouver aucun alors
+    qu'un match est bien prévu ce soir (heure US).
 
     Le cache utilise un `ttl=300` (5 minutes) - contrairement aux autres fonctions
     de chargement, ces données (lanceur probable, statut du match) peuvent changer
@@ -427,9 +448,9 @@ def obtenir_match_du_jour(team_id: int):
     """
     if not team_id:
         return None
-    aujourdhui = datetime.now().strftime('%Y-%m-%d')
+    aujourdhui_us = datetime.now(TZ_US_EASTERN).strftime('%Y-%m-%d')
     try:
-        matchs_du_jour = appeler_avec_retry(statsapi.schedule, date=aujourdhui, team=team_id)
+        matchs_du_jour = appeler_avec_retry(statsapi.schedule, date=aujourdhui_us, team=team_id)
     except Exception:
         return None
     if not matchs_du_jour:
@@ -438,12 +459,36 @@ def obtenir_match_du_jour(team_id: int):
     match = matchs_du_jour[0]  # cas des double programmes (doubleheader) : on retient le 1er match
     est_domicile = (match.get('home_id') == team_id)
 
+    # --- Double fuseau horaire : US Eastern (référence MLB) <-> France ---
+    # `game_datetime` est fourni par statsapi en UTC (ex: "2026-07-30T23:10:00Z").
+    # On le convertit dans les deux fuseaux demandés. Beaucoup de matchs se jouent
+    # en soirée aux USA, donc l'heure française correspondante tombe très souvent
+    # le LENDEMAIN matin : on affiche donc systématiquement la date (jour/mois)
+    # avec l'heure française pour éviter toute ambiguïté sur le jour civil
+    # (ex: "31/07 à 01:00"), même quand elle tombe le même jour que l'heure US.
+    heure_us_str = None
+    heure_paris_str = None
+    game_datetime_str = match.get('game_datetime')
+    if game_datetime_str:
+        try:
+            dt_utc = datetime.fromisoformat(game_datetime_str.replace('Z', '+00:00'))
+            dt_us = dt_utc.astimezone(TZ_US_EASTERN)
+            dt_paris = dt_utc.astimezone(TZ_PARIS)
+            # `%Z` donne l'abréviation correcte (EST ou EDT) selon la date, gérée
+            # automatiquement par `zoneinfo` (bascule heure d'été/hiver US).
+            heure_us_str = dt_us.strftime('%H:%M %Z')
+            heure_paris_str = dt_paris.strftime('%d/%m à %H:%M')
+        except Exception:
+            heure_us_str = None
+            heure_paris_str = None
+
     return {
         'adversaire': match.get('away_name') if est_domicile else match.get('home_name'),
         'est_domicile': est_domicile,
         'lanceur_notre_equipe': match.get('home_probable_pitcher') if est_domicile else match.get('away_probable_pitcher'),
         'lanceur_adverse': match.get('away_probable_pitcher') if est_domicile else match.get('home_probable_pitcher'),
-        'heure': match.get('game_datetime'),
+        'heure_us': heure_us_str or "—",
+        'heure_paris': heure_paris_str or "—",
         'statut': match.get('status'),
         'venue': match.get('venue_name'),
     }
@@ -920,30 +965,31 @@ with onglets[1]:
         team_ids_pred = get_team_ids_dict(annee)
         team_id_selectionne = team_ids_pred.get(equipe_abbr)
 
+        maintenant_us_aff = datetime.now(TZ_US_EASTERN)
+        maintenant_paris_aff = maintenant_us_aff.astimezone(TZ_PARIS)
+        st.caption(
+            f"📅 Aujourd'hui aux USA (heure de l'Est) : {maintenant_us_aff.strftime('%A %d %B %Y, %H:%M %Z')} "
+            f"— soit {maintenant_paris_aff.strftime('%A %d %B %Y, %H:%M')} en France."
+        )
+
         with st.spinner("Recherche du match du jour..."):
             match_du_jour = obtenir_match_du_jour(team_id_selectionne)
 
         if not match_du_jour:
-            st.info(f"Aucun match n'est prévu aujourd'hui pour les {EQUIPES_MLB.get(equipe_abbr, equipe_abbr)}.")
+            st.info(f"Aucun match n'est prévu aujourd'hui (heure US) pour les {EQUIPES_MLB.get(equipe_abbr, equipe_abbr)}.")
         else:
             lieu = "à domicile" if match_du_jour['est_domicile'] else "à l'extérieur"
             st.subheader(
                 f"🆚 {EQUIPES_MLB.get(equipe_abbr, equipe_abbr)} {lieu} contre {match_du_jour['adversaire']}"
             )
 
-            col_venue, col_heure, col_statut = st.columns(3)
+            col_venue, col_heure_us, col_heure_paris, col_statut = st.columns(4)
             with col_venue:
                 st.metric("Stade", match_du_jour['venue'] or "—")
-            with col_heure:
-                heure_aff = "—"
-                if match_du_jour['heure']:
-                    try:
-                        heure_aff = datetime.fromisoformat(
-                            match_du_jour['heure'].replace('Z', '+00:00')
-                        ).strftime('%H:%M UTC')
-                    except Exception:
-                        heure_aff = match_du_jour['heure']
-                st.metric("Heure", heure_aff)
+            with col_heure_us:
+                st.metric("Heure (US, Est)", match_du_jour['heure_us'])
+            with col_heure_paris:
+                st.metric("Heure (France)", match_du_jour['heure_paris'])
             with col_statut:
                 st.metric("Statut", match_du_jour['statut'] or "—")
 
