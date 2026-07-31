@@ -1173,6 +1173,333 @@ def construire_donnees_hot_pronostics(annee: int):
 
 
 # ============================================================
+# 3 ter. ONGLET "RÉSUMÉ" - Scores en direct et terminés du jour
+# ============================================================
+# Ce bloc alimente le tout premier onglet de l'application : un tableau récapitulatif
+# de TOUS les matchs MLB du jour (à venir / en cours / terminés), avec un bouton de
+# rafraîchissement manuel qui ne recharge QUE cet onglet (via `st.fragment`), pas toute
+# la page. Il réutilise le modèle de prédiction déjà calculé pour "Hot Pronostics"
+# (`construire_donnees_hot_pronostics`) pour la colonne "Comparatif Prédiction", au lieu
+# de dupliquer le calcul de probabilité de victoire.
+
+@st.cache_data
+def get_team_id_vers_infos(year: int = None):
+    """
+    Construit un dictionnaire {team_id: {'abbr', 'nom_complet', 'nickname'}} pour
+    l'année donnée. `nickname` (ex: 'Yankees') vient du champ `teamName` de statsapi -
+    distinct de `name` (nom complet, ex: 'New York Yankees') déjà utilisé ailleurs dans
+    ce fichier. Indexé par `team_id` (et non par abréviation) car les matchs du jour
+    (`statsapi.schedule`) exposent directement `home_id`/`away_id`, ce qui évite tout
+    risque d'ambiguïté de correspondance par nom d'équipe.
+    """
+    if year is None:
+        year = ANNEE_COURANTE
+    reponse = appeler_avec_retry(statsapi.get, 'teams', {'sportIds': 1, 'season': year})
+    result = {}
+    for t in reponse['teams']:
+        result[t['id']] = {
+            'abbr': t.get('abbreviation', '?'),
+            'nom_complet': t.get('name', '?'),
+            'nickname': t.get('teamName') or t.get('name', '?'),
+        }
+    return result
+
+
+def _ordinal_anglais(n) -> str:
+    """Formate un entier en ordinal anglais (1 -> '1st', 4 -> '4th', 11 -> '11th', ...)."""
+    n = int(n)
+    if 10 <= (n % 100) <= 20:
+        suffixe = 'th'
+    else:
+        suffixe = {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
+    return f"{n}{suffixe}"
+
+
+def _formater_statut_match(status_brut: str, current_inning, inning_state: str) -> str:
+    """
+    Traduit le statut brut statsapi (ex: 'In Progress', 'Final', 'Scheduled') en l'une
+    des catégories demandées : 'À venir', 'En cours (Bot 4th)' ou 'Terminé' - avec un
+    repli explicite pour les statuts rares (reporté/suspendu/annulé) plutôt que de les
+    faire tomber silencieusement dans une mauvaise catégorie.
+    """
+    s_lower = (status_brut or '').strip().lower()
+
+    if 'final' in s_lower or 'game over' in s_lower:
+        return "Terminé"
+
+    if s_lower == 'in progress':
+        abrev_manche = {
+            'top': 'Top', 'bottom': 'Bot', 'middle': 'Mid', 'end': 'End',
+        }.get((inning_state or '').strip().lower(), (inning_state or '').strip())
+        try:
+            manche_str = _ordinal_anglais(current_inning)
+        except (TypeError, ValueError):
+            manche_str = str(current_inning or '').strip()
+        detail = f"{abrev_manche} {manche_str}".strip()
+        return f"En cours ({detail})" if detail else "En cours"
+
+    if 'postponed' in s_lower:
+        return "Reporté"
+    if 'suspended' in s_lower:
+        return "Suspendu"
+    if 'cancelled' in s_lower or 'canceled' in s_lower:
+        return "Annulé"
+
+    return "À venir"  # Scheduled, Pre-Game, Warmup, Delayed Start, ...
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=200)
+def obtenir_hr_joueurs_match(game_id: int, est_domicile: bool, cache_bust: int = 0):
+    """
+    Récupère, via le boxscore statsapi d'un match, la liste des home runs marqués par
+    chaque joueur d'une équipe (domicile ou extérieur) sous forme de tuples
+    (nom_joueur, nb_hr). Fonction dédiée à l'onglet "Résumé" (plutôt que de réutiliser
+    `get_stats_offensives_match`, partagée avec l'onglet "Analyse par Équipe" et jamais
+    invalidée) car ici le match peut être EN COURS : `cache_bust` change la clé de
+    cache Streamlit à la demande (incrémenté par le bouton "Rafraîchir"), ce qui permet
+    de forcer un nouvel appel réseau sans dépendre d'un simple TTL. Le paramètre n'est
+    jamais lu dans le corps de la fonction, il ne sert qu'à invalider le cache.
+    `ttl=3600` reste un filet de sécurité pour éviter une croissance illimitée du cache,
+    pas le mécanisme principal de fraîcheur des données.
+    """
+    if not game_id:
+        return []
+    try:
+        box = appeler_avec_retry(statsapi.boxscore_data, int(game_id))
+        batters = box.get('homeBatters', []) if est_domicile else box.get('awayBatters', [])
+        resultats = []
+        for b in batters:
+            if not b.get('personId'):
+                continue  # ligne d'en-tête du tableau, pas un joueur
+            try:
+                hr = int(b.get('hr', 0) or 0)
+            except (ValueError, TypeError):
+                hr = 0
+            if hr > 0:
+                resultats.append((b.get('name', 'Inconnu'), hr))
+        return resultats
+    except Exception:
+        # Ne doit jamais faire planter l'onglet Résumé : simplement pas de HR affiché.
+        return []
+
+
+def _formater_segment_hr(abbr: str, hr_liste: list) -> str:
+    """Formate les HR d'UNE équipe : 'NYY: 2 (Judge, Soto)' ou 'NYY: 0' si aucun HR."""
+    total = sum(hr for _, hr in hr_liste)
+    if total <= 0:
+        return f"{abbr}: 0"
+    noms = [nom if hr <= 1 else f"{nom} x{hr}" for nom, hr in hr_liste]
+    return f"{abbr}: {total} ({', '.join(noms)})"
+
+
+def _formater_cellule_hr(away_abbr: str, hr_away: list, home_abbr: str, hr_home: list) -> str:
+    """Combine les HR des deux équipes d'un match dans une seule cellule de tableau."""
+    return f"{_formater_segment_hr(away_abbr, hr_away)} | {_formater_segment_hr(home_abbr, hr_home)}"
+
+
+def _comparer_prediction_vs_score(pred, home_nick: str, away_nick: str, home_score: int, away_score: int, a_commence: bool):
+    """
+    Retourne (texte_comparatif, icone_resultat) pour la colonne "Résultat vs Algo".
+    - `pred` : ligne (pandas Series) issue de `df_victoires` (Hot Pronostics) pour ce
+      match, ou None si aucune prédiction n'est encore disponible (lineups/lanceurs
+      partants pas encore publiés) -> ("Non disponible", "⏳").
+    - Sinon : l'équipe favorite est celle avec la probabilité de victoire la plus
+      haute. On compare cette équipe favorite à l'équipe actuellement en tête (ou
+      gagnante si le match est terminé) : ✅ si elle mène/a gagné, ❌ si elle est
+      menée/a perdu, ⏳ si le match n'a pas commencé ou si le score est à égalité.
+    """
+    if pred is None:
+        return "Non disponible", "⏳"
+
+    pct_home = pred.get('Proba Domicile (%)')
+    pct_away = pred.get('Proba Extérieur (%)')
+    if pct_home is None or pct_away is None or pd.isna(pct_home) or pd.isna(pct_away):
+        return "Non disponible", "⏳"
+
+    equipe_favorite = home_nick if pct_home >= pct_away else away_nick
+    pct_favori = max(pct_home, pct_away)
+    comparatif = f"{equipe_favorite} à {pct_favori:.0f}%"
+
+    if not a_commence or home_score == away_score:
+        return comparatif, "⏳"
+
+    equipe_en_tete = home_nick if home_score > away_score else away_nick
+    icone = "✅" if equipe_en_tete == equipe_favorite else "❌"
+    return comparatif, icone
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
+def construire_resume_matchs_du_jour(annee: int, cache_bust: int = 0):
+    """
+    Construit le tableau récapitulatif de TOUS les matchs MLB du jour (à venir, en
+    cours, terminés) pour l'onglet "Résumé". `cache_bust` sert uniquement à invalider
+    le cache Streamlit à la demande (bouton "Rafraîchir les scores en direct") - le
+    calcul du modèle de prédiction ("Hot Pronostics") n'est PAS reproduit à chaque
+    rafraîchissement (il a son propre cache à `ttl=1800`, car il ne change pas au fil
+    du match), seuls les scores/statuts/HR en direct sont re-récupérés.
+
+    Retourne (DataFrame, message_erreur). En cas d'échec réseau, le DataFrame est vide
+    et `message_erreur` contient un texte à afficher via `st.error` - aucune exception
+    ne remonte jamais à l'appelant (l'application ne doit jamais planter à cause d'un
+    appel API en direct).
+    """
+    if annee != ANNEE_COURANTE:
+        return pd.DataFrame(), None
+
+    aujourdhui_us = datetime.now(TZ_US_EASTERN).strftime('%Y-%m-%d')
+    try:
+        matchs_live = appeler_avec_retry(statsapi.schedule, date=aujourdhui_us, sportId=1)
+    except Exception as e:
+        return pd.DataFrame(), (
+            f"Impossible de récupérer les scores en direct pour le moment ({e}). "
+            "Réessayez dans quelques instants avec le bouton de rafraîchissement."
+        )
+
+    if not matchs_live:
+        return pd.DataFrame(), None
+
+    try:
+        infos_equipes = get_team_id_vers_infos(annee)
+    except Exception:
+        infos_equipes = {}
+
+    # Prédictions déjà calculées pour "Hot Pronostics" (même modèle, même journée),
+    # réutilisées ici pour la colonne "Comparatif Prédiction" - alignées par game_id
+    # (les deux fonctions parcourent le même calendrier du jour, dans le même ordre,
+    # mais on indexe explicitement par game_id pour rester robuste à tout changement
+    # d'ordre entre les deux appels).
+    try:
+        matchs_lineups, _, _, df_victoires = construire_donnees_hot_pronostics(annee)
+    except Exception:
+        matchs_lineups, df_victoires = [], pd.DataFrame()
+
+    predictions_par_game_id = {}
+    for idx, m in enumerate(matchs_lineups):
+        if idx < len(df_victoires):
+            predictions_par_game_id[m.get('game_id')] = df_victoires.iloc[idx]
+
+    lignes = []
+    for g in matchs_live:
+        game_id = g.get('game_id')
+        info_home = infos_equipes.get(g.get('home_id'), {})
+        info_away = infos_equipes.get(g.get('away_id'), {})
+        home_nick = info_home.get('nickname') or g.get('home_name') or '?'
+        away_nick = info_away.get('nickname') or g.get('away_name') or '?'
+        home_abbr = info_home.get('abbr') or (home_nick[:3].upper() if home_nick else '???')
+        away_abbr = info_away.get('abbr') or (away_nick[:3].upper() if away_nick else '???')
+
+        statut_str = _formater_statut_match(g.get('status'), g.get('current_inning'), g.get('inning_state'))
+        a_commence = statut_str == "Terminé" or statut_str.startswith("En cours") or statut_str == "Suspendu"
+
+        try:
+            home_score = int(g.get('home_score') or 0)
+            away_score = int(g.get('away_score') or 0)
+        except (TypeError, ValueError):
+            home_score, away_score = 0, 0
+
+        if a_commence:
+            score_str = f"{away_abbr} {away_score} - {home_abbr} {home_score}"
+            # Colonne texte (pas numérique) volontairement : elle doit pouvoir afficher
+            # "—" pour les matchs pas encore commencés sans faire planter la sérialisation
+            # Arrow du tableau (colonne à types mixtes int/str sinon).
+            total_runs = str(home_score + away_score)
+            hr_home = obtenir_hr_joueurs_match(game_id, True, cache_bust)
+            hr_away = obtenir_hr_joueurs_match(game_id, False, cache_bust)
+            hr_str = _formater_cellule_hr(away_abbr, hr_away, home_abbr, hr_home)
+        else:
+            score_str = "—"
+            total_runs = "—"
+            hr_str = "—"
+
+        pred = predictions_par_game_id.get(game_id)
+        comparatif_str, resultat_icone = _comparer_prediction_vs_score(
+            pred, home_nick, away_nick, home_score, away_score, a_commence
+        )
+
+        lignes.append({
+            'Match': f"{away_nick} vs {home_nick}",
+            'Statut': statut_str,
+            'Score': score_str,
+            'Total Runs': total_runs,
+            'Home Runs': hr_str,
+            'Comparatif Prédiction': comparatif_str,
+            'Résultat vs Algo': resultat_icone,
+        })
+
+    return pd.DataFrame(lignes), None
+
+
+@st.fragment
+def afficher_onglet_resume(annee: int):
+    """
+    Corps de l'onglet "Résumé" (bouton de rafraîchissement + tableau), encapsulé dans
+    un `st.fragment` : cliquer sur le bouton ne relance QUE cette fonction (nouvel
+    appel API + reconstruction du tableau), sans recharger le reste de l'application
+    (sidebar, autres onglets) ni la page web entière.
+    """
+    if 'resume_cache_bust' not in st.session_state:
+        st.session_state.resume_cache_bust = 0
+    if 'resume_derniere_actualisation' not in st.session_state:
+        st.session_state.resume_derniere_actualisation = None
+
+    col_bouton, col_info = st.columns([1, 2])
+    with col_bouton:
+        if st.button("🔄 Rafraîchir les scores en direct"):
+            st.session_state.resume_cache_bust += 1
+            st.session_state.resume_derniere_actualisation = datetime.now(TZ_PARIS)
+
+    with col_info:
+        if st.session_state.resume_derniere_actualisation:
+            st.caption(
+                "Dernière actualisation manuelle : "
+                f"{st.session_state.resume_derniere_actualisation.strftime('%H:%M:%S')} (heure française)."
+            )
+        else:
+            st.caption("Cliquez sur le bouton pour actualiser les scores en direct.")
+
+    if annee != ANNEE_COURANTE:
+        st.info(
+            f"Le résumé du jour n'est disponible que pour la saison en cours "
+            f"({ANNEE_COURANTE}). Sélectionnez {ANNEE_COURANTE} dans le menu de gauche."
+        )
+        return
+
+    with st.spinner("Récupération des scores en direct..."):
+        df_resume, message_erreur = construire_resume_matchs_du_jour(
+            annee, st.session_state.resume_cache_bust
+        )
+
+    if message_erreur:
+        st.error(f"⚠️ {message_erreur}")
+
+    if df_resume.empty:
+        if message_erreur is None:
+            st.info("Aucun match n'est prévu aujourd'hui (heure US).")
+        return
+
+    st.dataframe(
+        df_resume,
+        column_config={
+            "Match": st.column_config.TextColumn("Match", width="medium"),
+            "Statut": st.column_config.TextColumn("Statut", width="small"),
+            "Score": st.column_config.TextColumn("Score", width="small"),
+            "Total Runs": st.column_config.TextColumn("Total Runs", width="small"),
+            "Home Runs": st.column_config.TextColumn("Home Runs", width="large"),
+            "Comparatif Prédiction": st.column_config.TextColumn("Comparatif Prédiction", width="medium"),
+            "Résultat vs Algo": st.column_config.TextColumn("Résultat vs Algo", width="small"),
+        },
+        hide_index=True,
+    )
+
+    st.caption(
+        "✅ = l'équipe favorite de notre algorithme mène ou a gagné · ❌ = elle est menée ou a "
+        "perdu · ⏳ = match pas encore commencé, à égalité, ou prédiction pas encore disponible. "
+        "Le score, le total de runs et les home runs ne sont affichés qu'une fois le match "
+        "commencé."
+    )
+
+
+# ============================================================
 # 4. LISTE DES ÉQUIPES MLB (Abréviations officielles)
 # ============================================================
 
@@ -1209,16 +1536,26 @@ EQUIPES_MLB = get_teams_mlb_this_year(annee)
 # 6. ONGLETS PRINCIPAUX
 # ============================================================
 onglets = st.tabs([
+    "📊 Résumé",
     "🔥 Hot Pronostics",
     "📊 Analyse par Équipe",
     "🔮 Prédictions du jour"
 ], on_change="rerun")
 
 # --------------------------------------------------------------
-# ONGLET 1: HOT PRONOSTICS (scan global de tous les matchs du jour)
+# ONGLET 0: RÉSUMÉ (scores en direct et terminés du jour)
 # --------------------------------------------------------------
 with onglets[0]:
     if onglets[0].open:
+        st.header("📊 Résumé du jour")
+        st.markdown("### Suivi en direct de toutes les confrontations MLB du jour")
+        afficher_onglet_resume(annee)
+
+# --------------------------------------------------------------
+# ONGLET 1: HOT PRONOSTICS (scan global de tous les matchs du jour)
+# --------------------------------------------------------------
+with onglets[1]:
+    if onglets[1].open:
         st.header("🔥 Hot Pronostics du jour")
         st.markdown("### Les meilleurs pronostics du jour, tous matchs confondus")
         st.caption(
@@ -1324,7 +1661,7 @@ with onglets[0]:
 # --------------------------------------------------------------
 # ONGLET 2: ANALYSE PAR ÉQUIPE
 # --------------------------------------------------------------
-with onglets[1]:
+with onglets[2]:
     st.header("📊 Analyse des Runs par Équipe")
 
     col1, col2 = st.columns([1, 3])
@@ -1575,7 +1912,7 @@ with onglets[1]:
 # --------------------------------------------------------------
 # ONGLET 3: PRÉDICTIONS DU JOUR
 # --------------------------------------------------------------
-with onglets[2]:
+with onglets[3]:
     st.header("🔮 Prédictions du jour")
     st.markdown(f"Prédiction du match du jour pour les **{EQUIPES_MLB.get(equipe_abbr, equipe_abbr)}**")
     st.caption(
