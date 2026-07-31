@@ -767,6 +767,412 @@ def predire_joueurs_du_jour(cumul_runs_10, cumul_hr_10, stats_lanceur_adverse, t
 
 
 # ============================================================
+# 3 bis. "HOT PRONOSTICS" - Scan GLOBAL de tous les matchs du jour
+# ============================================================
+# Contrairement aux fonctions ci-dessus (centrées sur UNE équipe sélectionnée dans la
+# sidebar), ce bloc analyse TOUS les matchs prévus aujourd'hui (heure US), tous équipes
+# confondues, pour en extraire les meilleurs pronostics HR / Runs / Victoire du jour.
+# Chaque fonction ci-dessous est mise en cache (@st.cache_data) car ce sont des calculs
+# globaux coûteux (plusieurs dizaines de joueurs/lanceurs) qui ne doivent PAS être
+# relancés à chaque interaction utilisateur (changement d'équipe/saison dans la
+# sidebar) - seulement rafraîchis périodiquement (ttl) pour suivre les lineups qui se
+# précisent au fil de la journée.
+
+def _parser_stat_flottant(valeur) -> float:
+    """
+    Convertit une valeur de statistique statsapi en float, en gérant les cas où l'API
+    renvoie une chaîne non numérique (ex: '.---' pour un joueur sans at-bat) plutôt
+    qu'un nombre ou une chaîne vide.
+    """
+    try:
+        return float(valeur)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def obtenir_calendrier_jour_avec_lineups(annee: int):
+    """
+    Récupère TOUS les matchs prévus aujourd'hui (date du jour AUX USA, heure de l'Est -
+    voir justification dans `obtenir_match_du_jour`) via UN SEUL appel à l'endpoint
+    `schedule` hydraté avec `lineups,probablePitcher`, qui fournit en une fois : les
+    deux lanceurs partants prévus ET, quand elles sont déjà publiées par les équipes
+    (généralement 1 à 3h avant le match), les compositions d'équipe (lineup) dans
+    l'ORDRE de passage au bâton (position 1 = 1er de la liste, etc.).
+
+    Retourne une liste de dicts (un par match), avec une lineup vide ([]) pour un
+    camp si elle n'est pas encore annoncée - les tableaux "Hot Pronostics" qui se
+    basent sur les lineups s'adaptent en conséquence (ce match ne contribue tout
+    simplement pas encore de candidats HR/Run pour ce camp).
+    """
+    if annee != ANNEE_COURANTE:
+        return []
+
+    aujourdhui_us = datetime.now(TZ_US_EASTERN).strftime('%Y-%m-%d')
+    try:
+        reponse = appeler_avec_retry(
+            statsapi.get, 'schedule',
+            {'date': aujourdhui_us, 'sportId': 1, 'hydrate': 'lineups,probablePitcher'}
+        )
+    except Exception:
+        return []
+
+    matchs = []
+    for bloc_date in reponse.get('dates', []):
+        for g in bloc_date.get('games', []):
+            equipes = g.get('teams', {}) or {}
+            home = equipes.get('home', {}) or {}
+            away = equipes.get('away', {}) or {}
+            home_team = home.get('team', {}) or {}
+            away_team = away.get('team', {}) or {}
+            home_pitcher = home.get('probablePitcher') or {}
+            away_pitcher = away.get('probablePitcher') or {}
+
+            lineups = g.get('lineups', {}) or {}
+            home_lineup = [
+                {'id': j.get('id'), 'nom': j.get('fullName'), 'position': idx + 1}
+                for idx, j in enumerate(lineups.get('homePlayers', []) or [])
+                if j.get('id')
+            ]
+            away_lineup = [
+                {'id': j.get('id'), 'nom': j.get('fullName'), 'position': idx + 1}
+                for idx, j in enumerate(lineups.get('awayPlayers', []) or [])
+                if j.get('id')
+            ]
+
+            # Double fuseau horaire (même logique que `obtenir_match_du_jour`)
+            heure_us_str, heure_paris_str = None, None
+            game_datetime_str = g.get('gameDate')
+            if game_datetime_str:
+                try:
+                    dt_utc = datetime.fromisoformat(game_datetime_str.replace('Z', '+00:00'))
+                    heure_us_str = dt_utc.astimezone(TZ_US_EASTERN).strftime('%H:%M %Z')
+                    heure_paris_str = dt_utc.astimezone(TZ_PARIS).strftime('%d/%m à %H:%M')
+                except Exception:
+                    pass
+
+            matchs.append({
+                'game_id': g.get('gamePk'),
+                'home_id': home_team.get('id'),
+                'home_name': home_team.get('name'),
+                'away_id': away_team.get('id'),
+                'away_name': away_team.get('name'),
+                'home_pitcher_id': home_pitcher.get('id'),
+                'home_pitcher_name': home_pitcher.get('fullName'),
+                'away_pitcher_id': away_pitcher.get('id'),
+                'away_pitcher_name': away_pitcher.get('fullName'),
+                'home_lineup': home_lineup,
+                'away_lineup': away_lineup,
+                'venue': (g.get('venue') or {}).get('name'),
+                'statut': ((g.get('status') or {}).get('detailedState')),
+                'heure_us': heure_us_str or "—",
+                'heure_paris': heure_paris_str or "—",
+            })
+    return matchs
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def obtenir_moyennes_runs_recentes_toutes_equipes(annee: int, jours_historique: int = 25):
+    """
+    Calcule, pour CHAQUE équipe MLB, la moyenne de runs marqués sur ses 10 derniers
+    matchs terminés (Final) - via UN SEUL appel `schedule` couvrant une fenêtre de
+    date récente (tous équipes confondues), plutôt qu'un appel par équipe : l'API ne
+    permet pas de demander directement "10 derniers matchs, toutes équipes" en un
+    seul filtre, mais parcourir un large historique commun revient bien moins cher
+    que 30 appels individuels.
+    `jours_historique=25` donne une marge confortable au-dessus de 10 matchs même en
+    tenant compte des jours de repos/reports (une équipe MLB joue ~5-6 matchs/semaine).
+    """
+    if annee != ANNEE_COURANTE:
+        return {}
+
+    aujourdhui = datetime.now(TZ_US_EASTERN)
+    date_debut = (aujourdhui - pd.Timedelta(days=jours_historique)).strftime('%Y-%m-%d')
+    date_fin = aujourdhui.strftime('%Y-%m-%d')
+    try:
+        matchs = appeler_avec_retry(
+            statsapi.schedule, start_date=date_debut, end_date=date_fin, sportId=1
+        )
+    except Exception:
+        return {}
+
+    matchs_par_equipe = {}
+    for g in matchs:
+        if g.get('status') != 'Final':
+            continue
+        home_id, away_id = g.get('home_id'), g.get('away_id')
+        home_score, away_score = g.get('home_score'), g.get('away_score')
+        if home_score is None or away_score is None:
+            continue
+        date_match = g.get('game_date', '')
+        if home_id:
+            matchs_par_equipe.setdefault(home_id, []).append((date_match, home_score))
+        if away_id:
+            matchs_par_equipe.setdefault(away_id, []).append((date_match, away_score))
+
+    moyennes = {}
+    for team_id, liste in matchs_par_equipe.items():
+        dix_derniers = sorted(liste, key=lambda x: x[0])[-10:]
+        if dix_derniers:
+            moyennes[team_id] = sum(r for _, r in dix_derniers) / len(dix_derniers)
+    return moyennes
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def obtenir_stats_lanceurs_par_id(pitcher_ids: tuple):
+    """
+    Récupère ERA / WHIP / HR-par-9 (saison en cours) pour un ENSEMBLE de lanceurs en
+    un minimum d'appels API : l'endpoint `people` accepte une liste de `personIds`
+    séparés par des virgules et une hydratation de stats groupée, ce qui permet de
+    couvrir tous les lanceurs partants prévus aujourd'hui (jusqu'à ~30) en 1 seul
+    appel au lieu d'un appel par lanceur (comme le ferait `obtenir_stats_lanceur`,
+    conservée telle quelle pour l'onglet "Prédictions du jour" mono-équipe).
+    """
+    ids = sorted({str(i) for i in pitcher_ids if i})
+    resultats = {}
+    if not ids:
+        return resultats
+
+    for debut in range(0, len(ids), 40):  # lots de 40 IDs pour rester sur des URLs raisonnables
+        lot = ids[debut:debut + 40]
+        try:
+            reponse = appeler_avec_retry(
+                statsapi.get, 'people',
+                {'personIds': ','.join(lot), 'hydrate': 'stats(group=[pitching],type=[season])'}
+            )
+        except Exception:
+            continue
+        for p in reponse.get('people', []):
+            for bloc in p.get('stats', []):
+                if bloc.get('type', {}).get('displayName') != 'season':
+                    continue
+                splits = bloc.get('splits') or []
+                if not splits:
+                    continue
+                s = splits[0].get('stat', {})
+                if not s.get('era'):
+                    continue
+                resultats[p['id']] = {
+                    'nom': p.get('fullName'),
+                    'era': _parser_stat_flottant(s.get('era')),
+                    'whip': _parser_stat_flottant(s.get('whip')),
+                    'hr_par_9': _parser_stat_flottant(s.get('homeRunsPer9')),
+                }
+    return resultats
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def obtenir_stats_batteurs_par_id(batter_ids: tuple):
+    """
+    Récupère, pour un ENSEMBLE de batteurs (lineups du jour), leur SLG/OBP de saison
+    ET sur leurs 10 derniers matchs (`type=lastXGames,limit=10` - stat officielle
+    statsapi équivalente à une "forme récente"), ainsi que leur nombre de HR sur ces
+    10 derniers matchs. Comme pour les lanceurs, hydratation combinée
+    (saison + lastXGames) en un minimum d'appels API par lots de 40 IDs.
+    """
+    ids = sorted({str(i) for i in batter_ids if i})
+    resultats = {}
+    if not ids:
+        return resultats
+
+    for debut in range(0, len(ids), 40):
+        lot = ids[debut:debut + 40]
+        try:
+            reponse = appeler_avec_retry(
+                statsapi.get, 'people',
+                {'personIds': ','.join(lot), 'hydrate': 'stats(group=[hitting],type=[season,lastXGames],limit=10)'}
+            )
+        except Exception:
+            continue
+        for p in reponse.get('people', []):
+            entree = {
+                'nom': p.get('fullName'),
+                'slg_saison': 0.0, 'obp_saison': 0.0,
+                'slg_10': 0.0, 'obp_10': 0.0, 'hr_10': 0, 'matchs_10': 0,
+            }
+            for bloc in p.get('stats', []):
+                type_nom = bloc.get('type', {}).get('displayName')
+                splits = bloc.get('splits') or []
+                if not splits:
+                    continue
+                s = splits[0].get('stat', {})
+                if type_nom == 'season':
+                    entree['slg_saison'] = _parser_stat_flottant(s.get('slg'))
+                    entree['obp_saison'] = _parser_stat_flottant(s.get('obp'))
+                elif type_nom == 'lastXGames':
+                    entree['slg_10'] = _parser_stat_flottant(s.get('slg'))
+                    entree['obp_10'] = _parser_stat_flottant(s.get('obp'))
+                    entree['hr_10'] = int(s.get('homeRuns') or 0)
+                    entree['matchs_10'] = int(s.get('gamesPlayed') or 0)
+            resultats[p['id']] = entree
+    return resultats
+
+
+def _normaliser_colonne(serie: pd.Series) -> pd.Series:
+    """
+    Normalisation min-max dans [0, 1] d'une colonne de statistiques, pour pouvoir
+    combiner des métriques d'échelles très différentes (ex: SLG ~0.3-0.6, HR sur 10
+    matchs 0-6, ERA 2-6) dans un même indice pondéré. Renvoie une série neutre à 0.5
+    si la colonne est constante (évite une division par zéro sans fausser le classement).
+    """
+    minimum, maximum = serie.min(), serie.max()
+    if pd.isna(minimum) or pd.isna(maximum) or maximum == minimum:
+        return pd.Series([0.5] * len(serie), index=serie.index)
+    return (serie - minimum) / (maximum - minimum)
+
+
+def _calculer_top5_home_runs(candidats: list) -> pd.DataFrame:
+    """
+    Construit le classement "Top 5 Home Runs probables" à partir de la liste de
+    candidats (un dict par batteur titulaire d'un match du jour dont la lineup est
+    connue). Indice pondéré : SLG récent 45% + HR/10 derniers matchs 35% +
+    HR/9 du lanceur adverse 20% (les 3 facteurs demandés), chaque métrique étant
+    normalisée (min-max) sur l'ensemble des candidats du jour avant pondération.
+    """
+    if not candidats:
+        return pd.DataFrame()
+    df = pd.DataFrame(candidats)
+    indice = (
+        _normaliser_colonne(df['SLG récent']) * 0.45
+        + _normaliser_colonne(df['HR (10 derniers matchs)']) * 0.35
+        + _normaliser_colonne(df['HR/9 lanceur adverse']) * 0.20
+    ) * 100
+    df['Indice HR (/100)'] = indice.round(1)
+    df = df.sort_values('Indice HR (/100)', ascending=False).head(5).reset_index(drop=True)
+    return df[[
+        'Joueur', 'Équipe', 'Adversaire', 'Lanceur adverse',
+        'SLG récent', 'HR (10 derniers matchs)', 'HR/9 lanceur adverse', 'Indice HR (/100)'
+    ]]
+
+
+def _calculer_top5_runs(candidats: list) -> pd.DataFrame:
+    """
+    Construit le classement "Top 5 joueurs pour marquer un run" à partir de la liste
+    de candidats. Indice pondéré : OBP 45% + bonus de position dans le lineup
+    (favorise les positions 1 à 4) 25% + ERA du lanceur adverse 30%, chaque métrique
+    étant normalisée (min-max) sur l'ensemble des candidats du jour avant pondération.
+    """
+    if not candidats:
+        return pd.DataFrame()
+    df = pd.DataFrame(candidats)
+    # Bonus de position : décroît linéairement de la place 1 (bonus max) à la place 9
+    # (bonus nul), pour "privilégier les batteurs 1 à 4" tout en restant continu.
+    bonus_position = (9 - df['Position lineup']).clip(lower=0)
+    indice = (
+        _normaliser_colonne(df['OBP']) * 0.45
+        + _normaliser_colonne(bonus_position) * 0.25
+        + _normaliser_colonne(df['ERA lanceur adverse']) * 0.30
+    ) * 100
+    df['Indice Run (/100)'] = indice.round(1)
+    df = df.sort_values('Indice Run (/100)', ascending=False).head(5).reset_index(drop=True)
+    return df[[
+        'Joueur', 'Équipe', 'Adversaire', 'Lanceur adverse',
+        'OBP', 'Position lineup', 'ERA lanceur adverse', 'Indice Run (/100)'
+    ]]
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def construire_donnees_hot_pronostics(annee: int):
+    """
+    Calcul GLOBAL et coûteux (mis en cache via @st.cache_data, ttl=30min) qui scanne
+    TOUS les matchs du jour et construit les 3 tableaux de l'onglet "Hot Pronostics" :
+    Top 5 Home Runs, Top 5 joueurs pour marquer un run, et le récapitulatif Win/Lose
+    de chaque confrontation. Ce calcul est indépendant de l'équipe sélectionnée dans
+    la sidebar, donc mis en cache séparément (clé = `annee` uniquement) pour ne
+    jamais être relancé inutilement quand l'utilisateur change d'équipe.
+
+    Retourne (matchs_du_jour, df_top5_hr, df_top5_runs, df_victoires).
+    """
+    matchs_du_jour = obtenir_calendrier_jour_avec_lineups(annee)
+    if not matchs_du_jour:
+        return [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    moyennes_runs_equipes = obtenir_moyennes_runs_recentes_toutes_equipes(annee)
+
+    tous_pitcher_ids = set()
+    tous_batter_ids = set()
+    for m in matchs_du_jour:
+        tous_pitcher_ids.update([m['home_pitcher_id'], m['away_pitcher_id']])
+        tous_batter_ids.update(j['id'] for j in m['home_lineup'])
+        tous_batter_ids.update(j['id'] for j in m['away_lineup'])
+
+    stats_lanceurs = obtenir_stats_lanceurs_par_id(tuple(tous_pitcher_ids))
+    stats_batteurs = obtenir_stats_batteurs_par_id(tuple(tous_batter_ids))
+
+    candidats_hr = []
+    candidats_runs = []
+    lignes_victoire = []
+
+    for m in matchs_du_jour:
+        stats_p_home = stats_lanceurs.get(m['home_pitcher_id'])
+        stats_p_away = stats_lanceurs.get(m['away_pitcher_id'])
+
+        # --- Tableau Win/Lose : on réutilise TEL QUEL le modèle heuristique déjà
+        # validé dans l'onglet "Prédictions du jour" (`predire_probabilite_victoire`),
+        # mais ici avec les moyennes de runs RÉELLES des deux équipes (au lieu du
+        # proxy "runs concédés par notre équipe" utilisé dans l'onglet mono-équipe,
+        # où l'attaque adverse n'était pas directement disponible).
+        pct_home, pct_away = predire_probabilite_victoire(
+            moyennes_runs_equipes.get(m['home_id']),
+            moyennes_runs_equipes.get(m['away_id']),
+            stats_p_home,
+            stats_p_away,
+            est_domicile=True,
+        )
+        lignes_victoire.append({
+            'Heure (France)': m['heure_paris'],
+            'Équipe Domicile': m['home_name'],
+            'Lanceur Domicile': m['home_pitcher_name'] or 'Non annoncé',
+            'Équipe Extérieur': m['away_name'],
+            'Lanceur Extérieur': m['away_pitcher_name'] or 'Non annoncé',
+            'Proba Domicile (%)': pct_home,
+            'Proba Extérieur (%)': pct_away,
+        })
+
+        # --- Candidats HR / Runs : chaque lineup connue est croisée avec le lanceur
+        # partant ADVERSE (celui qu'elle affrontera aujourd'hui).
+        for camp_lineup, lanceur_adverse, equipe_nom, adversaire_nom in (
+            (m['home_lineup'], stats_p_away, m['home_name'], m['away_name']),
+            (m['away_lineup'], stats_p_home, m['away_name'], m['home_name']),
+        ):
+            for joueur in camp_lineup:
+                s = stats_batteurs.get(joueur['id'])
+                if not s:
+                    continue
+                # SLG "récent" : sur les 10 derniers matchs si le joueur en a
+                # suffisamment joué récemment (>=3), sinon repli sur le SLG saison
+                # (évite qu'un retour de blessure/appel des ligues mineures avec 1
+                # seul match récent fausse le classement dans un sens ou l'autre).
+                slg_recent = s['slg_10'] if s['matchs_10'] >= 3 else s['slg_saison']
+                nom_lanceur_adverse = lanceur_adverse['nom'] if lanceur_adverse else 'Non annoncé'
+
+                candidats_hr.append({
+                    'Joueur': joueur['nom'],
+                    'Équipe': equipe_nom,
+                    'Adversaire': adversaire_nom,
+                    'Lanceur adverse': nom_lanceur_adverse,
+                    'SLG récent': slg_recent,
+                    'HR (10 derniers matchs)': s['hr_10'],
+                    'HR/9 lanceur adverse': lanceur_adverse['hr_par_9'] if lanceur_adverse else 1.1,
+                })
+                candidats_runs.append({
+                    'Joueur': joueur['nom'],
+                    'Équipe': equipe_nom,
+                    'Adversaire': adversaire_nom,
+                    'Lanceur adverse': nom_lanceur_adverse,
+                    'OBP': s['obp_saison'],
+                    'Position lineup': joueur['position'],
+                    'ERA lanceur adverse': lanceur_adverse['era'] if lanceur_adverse else 4.5,
+                })
+
+    df_top5_hr = _calculer_top5_home_runs(candidats_hr)
+    df_top5_runs = _calculer_top5_runs(candidats_runs)
+    df_victoires = pd.DataFrame(lignes_victoire)
+
+    return matchs_du_jour, df_top5_hr, df_top5_runs, df_victoires
+
+
+# ============================================================
 # 4. LISTE DES ÉQUIPES MLB (Abréviations officielles)
 # ============================================================
 
@@ -803,14 +1209,122 @@ EQUIPES_MLB = get_teams_mlb_this_year(annee)
 # 6. ONGLETS PRINCIPAUX
 # ============================================================
 onglets = st.tabs([
+    "🔥 Hot Pronostics",
     "📊 Analyse par Équipe",
     "🔮 Prédictions du jour"
-])
+], on_change="rerun")
 
 # --------------------------------------------------------------
-# ONGLET 1: ANALYSE PAR ÉQUIPE
+# ONGLET 1: HOT PRONOSTICS (scan global de tous les matchs du jour)
 # --------------------------------------------------------------
 with onglets[0]:
+    if onglets[0].open:
+        st.header("🔥 Hot Pronostics du jour")
+        st.markdown("### Les meilleurs pronostics du jour, tous matchs confondus")
+        st.caption(
+            "⚠️ Estimations statistiques automatiques calculées à partir des lineups probables "
+            "(quand elles sont déjà publiées par les équipes), des lanceurs partants et de la "
+            "forme récente des joueurs. Ce ne sont pas des garanties de résultat : simples "
+            "heuristiques, à utiliser uniquement à titre informatif, avec discernement si vous "
+            "vous en servez pour parier."
+        )
+
+        if annee != ANNEE_COURANTE:
+            st.info(
+                f"Les Hot Pronostics ne sont disponibles que pour la saison en cours "
+                f"({ANNEE_COURANTE}). Sélectionnez {ANNEE_COURANTE} dans le menu de gauche."
+            )
+        else:
+            with st.spinner("Analyse de tous les matchs du jour (lineups, lanceurs, forme récente)..."):
+                matchs_jour, df_top5_hr, df_top5_runs, df_victoires = construire_donnees_hot_pronostics(annee)
+
+            if not matchs_jour:
+                st.info("Aucun match n'est prévu aujourd'hui (heure US).")
+            else:
+                nb_lineups_home = sum(1 for m in matchs_jour if m['home_lineup'])
+                nb_lineups_away = sum(1 for m in matchs_jour if m['away_lineup'])
+                nb_matchs_avec_lineup = sum(1 for m in matchs_jour if m['home_lineup'] or m['away_lineup'])
+                st.caption(
+                    f"📅 {len(matchs_jour)} match(s) au programme aujourd'hui (heure US) · "
+                    f"lineup officielle publiée pour {nb_matchs_avec_lineup} match(s) sur {len(matchs_jour)} "
+                    "(les lineups sont généralement annoncées 1 à 3h avant chaque match - "
+                    "revenez plus tard pour voir apparaître les matchs restants)."
+                )
+
+                st.markdown("---")
+                st.subheader("💣 Top 5 Home Runs probables")
+                if df_top5_hr.empty:
+                    st.info(
+                        "Aucune lineup officielle n'est encore publiée pour les matchs du jour. "
+                        "Réessayez plus près de l'heure des matchs."
+                    )
+                else:
+                    st.dataframe(
+                        df_top5_hr,
+                        column_config={
+                            "SLG récent": st.column_config.NumberColumn("SLG récent", format="%.3f"),
+                            "HR (10 derniers matchs)": st.column_config.NumberColumn("HR (10 derniers matchs)", format="%d"),
+                            "HR/9 lanceur adverse": st.column_config.NumberColumn("HR/9 lanceur adverse", format="%.2f"),
+                            "Indice HR (/100)": st.column_config.ProgressColumn(
+                                "Indice HR (/100)", min_value=0, max_value=100, format="%.0f"
+                            ),
+                        },
+                        hide_index=True,
+                    )
+
+                st.markdown("---")
+                st.subheader("🏃 Top 5 joueurs pour marquer un run")
+                if df_top5_runs.empty:
+                    st.info(
+                        "Aucune lineup officielle n'est encore publiée pour les matchs du jour. "
+                        "Réessayez plus près de l'heure des matchs."
+                    )
+                else:
+                    st.dataframe(
+                        df_top5_runs,
+                        column_config={
+                            "OBP": st.column_config.NumberColumn("OBP", format="%.3f"),
+                            "Position lineup": st.column_config.NumberColumn("Position lineup", format="%d"),
+                            "ERA lanceur adverse": st.column_config.NumberColumn("ERA lanceur adverse", format="%.2f"),
+                            "Indice Run (/100)": st.column_config.ProgressColumn(
+                                "Indice Run (/100)", min_value=0, max_value=100, format="%.0f"
+                            ),
+                        },
+                        hide_index=True,
+                    )
+
+                st.markdown("---")
+                st.subheader("🎲 Probabilités Win/Lose du jour")
+                if df_victoires.empty:
+                    st.info("Aucune donnée de probabilité de victoire disponible pour le moment.")
+                else:
+                    st.dataframe(
+                        df_victoires,
+                        column_config={
+                            "Proba Domicile (%)": st.column_config.ProgressColumn(
+                                "Proba Domicile (%)", min_value=0, max_value=100, format="%.1f%%"
+                            ),
+                            "Proba Extérieur (%)": st.column_config.ProgressColumn(
+                                "Proba Extérieur (%)", min_value=0, max_value=100, format="%.1f%%"
+                            ),
+                        },
+                        hide_index=True,
+                    )
+
+                st.caption(
+                    "**Méthodologie** — Home Runs : SLG récent (45%) + HR sur les 10 derniers matchs "
+                    "(35%) + HR/9 du lanceur partant adverse (20%). Runs : OBP saison (45%) + position "
+                    "dans le lineup (25%, positions 1 à 4 favorisées) + ERA du lanceur partant adverse "
+                    "(30%). Win/Lose : moyenne de runs marqués sur les 10 derniers matchs de chaque "
+                    "équipe + ERA/WHIP des lanceurs partants du jour (même modèle que l'onglet "
+                    "\"Prédictions du jour\", détaillé plus bas). Chaque indice est normalisé sur "
+                    "l'ensemble des candidats du jour, donc relatif à la journée en cours."
+                )
+
+# --------------------------------------------------------------
+# ONGLET 2: ANALYSE PAR ÉQUIPE
+# --------------------------------------------------------------
+with onglets[1]:
     st.header("📊 Analyse des Runs par Équipe")
 
     col1, col2 = st.columns([1, 3])
@@ -1059,9 +1573,9 @@ with onglets[0]:
         st.error("Impossible de charger les données. Vérifiez l'abréviation de l'équipe.")
 
 # --------------------------------------------------------------
-# ONGLET 2: PRÉDICTIONS DU JOUR
+# ONGLET 3: PRÉDICTIONS DU JOUR
 # --------------------------------------------------------------
-with onglets[1]:
+with onglets[2]:
     st.header("🔮 Prédictions du jour")
     st.markdown(f"Prédiction du match du jour pour les **{EQUIPES_MLB.get(equipe_abbr, equipe_abbr)}**")
     st.caption(
