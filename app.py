@@ -1801,52 +1801,103 @@ def _formater_statut_match(status_brut: str, current_inning, inning_state: str) 
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=200)
-def obtenir_hr_joueurs_match(game_id: int, est_domicile: bool, cache_bust: int = 0):
+def obtenir_scoreurs_runs_et_hr_match(game_id: int, est_domicile: bool, cache_bust: int = 0):
     """
-    Récupère, via le boxscore statsapi d'un match, la liste des home runs marqués par
-    chaque joueur d'une équipe (domicile ou extérieur) sous forme de tuples
-    (nom_joueur, nb_hr). Fonction dédiée à l'onglet "Résumé" (plutôt que de réutiliser
-    `get_stats_offensives_match`, partagée avec l'onglet "Analyse par Équipe" et jamais
-    invalidée) car ici le match peut être EN COURS : `cache_bust` change la clé de
-    cache Streamlit à la demande (incrémenté par le bouton "Rafraîchir"), ce qui permet
-    de forcer un nouvel appel réseau sans dépendre d'un simple TTL. Le paramètre n'est
-    jamais lu dans le corps de la fonction, il ne sert qu'à invalider le cache.
-    `ttl=3600` reste un filet de sécurité pour éviter une croissance illimitée du cache,
-    pas le mécanisme principal de fraîcheur des données.
+    Récupère, via UN SEUL appel au boxscore statsapi d'un match, les runs ET les home
+    runs marqués par chaque joueur d'une équipe (domicile ou extérieur).
+    Retourne (liste_runs, liste_hr) où chaque liste est une liste de tuples
+    (nom_joueur, nb). Fonction dédiée à l'onglet "Résumé" / bilan de la veille
+    (plutôt que de réutiliser `get_stats_offensives_match`, partagée avec l'onglet
+    "Analyse par Équipe" et jamais invalidée) car ici le match peut être EN COURS :
+    `cache_bust` change la clé de cache Streamlit à la demande. `ttl=3600` reste un
+    filet de sécurité pour éviter une croissance illimitée du cache.
     """
     if not game_id:
-        return []
+        return [], []
     try:
         box = appeler_avec_retry(statsapi.boxscore_data, int(game_id))
         batters = box.get('homeBatters', []) if est_domicile else box.get('awayBatters', [])
-        resultats = []
+        runs_par_joueur = {}
+        hr_par_joueur = {}
         for b in batters:
             if not b.get('personId'):
                 continue  # ligne d'en-tête du tableau, pas un joueur
+            nom = b.get('name', 'Inconnu')
+            try:
+                runs = int(b.get('r', 0) or 0)
+            except (ValueError, TypeError):
+                runs = 0
             try:
                 hr = int(b.get('hr', 0) or 0)
             except (ValueError, TypeError):
                 hr = 0
+            if runs > 0:
+                runs_par_joueur[nom] = runs_par_joueur.get(nom, 0) + runs
             if hr > 0:
-                resultats.append((b.get('name', 'Inconnu'), hr))
-        return resultats
+                hr_par_joueur[nom] = hr_par_joueur.get(nom, 0) + hr
+        return list(runs_par_joueur.items()), list(hr_par_joueur.items())
     except Exception:
-        # Ne doit jamais faire planter l'onglet Résumé : simplement pas de HR affiché.
-        return []
+        # Ne doit jamais faire planter l'onglet Résumé : simplement pas de scoreurs affichés.
+        return [], []
 
 
-def _formater_segment_hr(abbr: str, hr_liste: list) -> str:
-    """Formate les HR d'UNE équipe : 'NYY: 2 (Judge, Soto)' ou 'NYY: 0' si aucun HR."""
-    total = sum(hr for _, hr in hr_liste)
+def obtenir_hr_joueurs_match(game_id: int, est_domicile: bool, cache_bust: int = 0):
+    """
+    Compatibilité : retourne uniquement les home runs (liste de tuples (nom, nb_hr))
+    d'une équipe pour UN match. Délègue à `obtenir_scoreurs_runs_et_hr_match` pour
+    mutualiser l'appel boxscore / le cache.
+    """
+    _, hrs = obtenir_scoreurs_runs_et_hr_match(game_id, est_domicile, cache_bust)
+    return hrs
+
+
+def _formater_segment_scoreurs(abbr: str, scoreurs: list) -> str:
+    """Formate les scoreurs d'UNE équipe : 'NYY: 2 (Judge, Soto)' ou 'NYY: 0' si aucun."""
+    total = sum(nb for _, nb in scoreurs)
     if total <= 0:
         return f"{abbr}: 0"
-    noms = [nom if hr <= 1 else f"{nom} x{hr}" for nom, hr in hr_liste]
+    noms = [nom if nb <= 1 else f"{nom} x{nb}" for nom, nb in scoreurs]
     return f"{abbr}: {total} ({', '.join(noms)})"
 
 
 def _formater_cellule_hr(away_abbr: str, hr_away: list, home_abbr: str, hr_home: list) -> str:
     """Combine les HR des deux équipes d'un match dans une seule cellule de tableau."""
-    return f"{_formater_segment_hr(away_abbr, hr_away)} | {_formater_segment_hr(home_abbr, hr_home)}"
+    return (
+        f"{_formater_segment_scoreurs(away_abbr, hr_away)} | "
+        f"{_formater_segment_scoreurs(home_abbr, hr_home)}"
+    )
+
+
+def _formater_cellule_total_runs(total: int, away_abbr: str, runs_away: list,
+                                 home_abbr: str, runs_home: list) -> str:
+    """
+    Colonne "Total Runs" du bilan de la veille : total du match + détail des joueurs
+    ayant marqué un run, au même format que la colonne HR (par équipe).
+    Ex: '11 — NYY: 5 (Judge, Soto x2) | BOS: 6 (Devers, Yoshida)'
+    """
+    detail = (
+        f"{_formater_segment_scoreurs(away_abbr, runs_away)} | "
+        f"{_formater_segment_scoreurs(home_abbr, runs_home)}"
+    )
+    return f"{total} — {detail}"
+
+
+def _trouver_prediction_match(predictions_par_cle: dict, cle):
+    """
+    Retrouve la prédiction archivée pour un match en tolérant les écarts de type de
+    clé (int vs str) fréquents après sérialisation JSON de l'historique : sans cela,
+    un `game_id` entier côté calendrier ne matchait plus la même valeur stockée en
+    chaîne (ou l'inverse), et toutes les colonnes de bilan restaient à
+    "Prédiction non disponible" alors que l'instantané existait bien.
+    """
+    if cle in predictions_par_cle:
+        return predictions_par_cle[cle]
+    if cle is None:
+        return None
+    try:
+        return predictions_par_cle.get(int(cle)) or predictions_par_cle.get(str(cle))
+    except (TypeError, ValueError):
+        return predictions_par_cle.get(str(cle))
 
 
 def _comparer_prediction_vs_score(pred, home_nick: str, away_nick: str, home_score: int, away_score: int, a_commence: bool):
@@ -2048,27 +2099,24 @@ def _bilan_over_under(total_runs_predit, total_runs_reel: int, ligne: float):
     """Retourne (texte, icône) comparant la projection Over/Under d'hier au total réel."""
     if total_runs_predit is None:
         return "Prédiction non disponible", "⏳"
-    direction_predite = "Over" if total_runs_predit > ligne else "Under"
-    direction_reelle = "Over" if total_runs_reel > ligne else "Under"
-    icone = "✅" if direction_predite == direction_reelle else "❌"
+
+    def _direction(total):
+        if total > ligne:
+            return "Over"
+        if total < ligne:
+            return "Under"
+        return "Push"  # pile sur la ligne : ni Over ni Under
+
+    direction_predite = _direction(total_runs_predit)
+    direction_reelle = _direction(total_runs_reel)
+    if direction_reelle == "Push":
+        icone = "⏳"
+    else:
+        icone = "✅" if direction_predite == direction_reelle else "❌"
     return (
         f"{direction_predite} annoncé (projection {total_runs_predit:.1f}, ligne {ligne:.1f}) "
         f"→ réel {total_runs_reel} ({direction_reelle})"
     ), icone
-
-
-def _bilan_hr(candidats_home: list, candidats_away: list, hr_home_reels: list, hr_away_reels: list):
-    """Retourne (texte, icône) : au moins un des joueurs surveillés hier a-t-il réellement frappé un HR ?"""
-    candidats = [c for c in (candidats_home or []) + (candidats_away or []) if c]
-    if not candidats:
-        return "Prédiction non disponible", "⏳"
-    scoreurs_reels = {nom for nom, _ in hr_home_reels} | {nom for nom, _ in hr_away_reels}
-    touches = [c for c in candidats if c in scoreurs_reels]
-    icone = "✅" if touches else "❌"
-    texte = f"Surveillés : {', '.join(candidats)}"
-    if touches:
-        texte += f" → a frappé : {', '.join(touches)}"
-    return texte, icone
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -2116,13 +2164,29 @@ def construire_bilan_veille(annee: int):
 
     predictions_hier = _charger_historique_predictions().get(date_hier_str, {}).get('matches', [])
     predictions_disponibles = len(predictions_hier) > 0
-    predictions_par_game_id = {p.get('game_id'): p for p in predictions_hier}
+    # Indexé à la fois en int et en str pour tolérer la sérialisation JSON (voir
+    # `_trouver_prediction_match`).
+    predictions_par_game_id = {}
+    for p in predictions_hier:
+        gid = p.get('game_id')
+        if gid is None:
+            continue
+        predictions_par_game_id[gid] = p
+        predictions_par_game_id[str(gid)] = p
+        try:
+            predictions_par_game_id[int(gid)] = p
+        except (TypeError, ValueError):
+            pass
 
     ligne_ou = obtenir_ligne_over_under_saison(annee)
 
     lignes = []
     for g in matchs_hier:
-        if g.get('status') != 'Final':
+        # statsapi peut renvoyer "Final", "Game Over", "Final: Tied", etc. - on
+        # réutilise la même logique que `_formater_statut_match` pour ne pas
+        # exclure silencieusement des matchs terminés du bilan.
+        statut_norm = (g.get('status') or '').strip().lower()
+        if 'final' not in statut_norm and 'game over' not in statut_norm:
             continue
         game_id = g.get('game_id')
         info_home = infos_equipes.get(g.get('home_id'), {})
@@ -2139,12 +2203,10 @@ def construire_bilan_veille(annee: int):
             continue
         total_reel = home_score + away_score
 
-        hr_home = obtenir_hr_joueurs_match(game_id, True)
-        hr_away = obtenir_hr_joueurs_match(game_id, False)
+        runs_home, hr_home = obtenir_scoreurs_runs_et_hr_match(game_id, True)
+        runs_away, hr_away = obtenir_scoreurs_runs_et_hr_match(game_id, False)
 
-        pred = predictions_par_game_id.get(game_id)
-        candidats_hr_home = pred.get('candidats_hr_home', []) if pred else []
-        candidats_hr_away = pred.get('candidats_hr_away', []) if pred else []
+        pred = _trouver_prediction_match(predictions_par_game_id, game_id)
         proba_home = pred.get('proba_home') if pred else None
         proba_away = pred.get('proba_away') if pred else None
         total_predit = pred.get('total_runs_predit') if pred else None
@@ -2153,19 +2215,19 @@ def construire_bilan_veille(annee: int):
             proba_home, proba_away, home_nick, away_nick, home_score, away_score
         )
         texte_ou, icone_ou = _bilan_over_under(total_predit, total_reel, ligne_ou)
-        texte_hr, icone_hr = _bilan_hr(candidats_hr_home, candidats_hr_away, hr_home, hr_away)
 
         lignes.append({
             'Match': f"{away_nick} vs {home_nick}",
             'Statut': "Terminé",
             'Score': f"{away_abbr} {away_score} - {home_abbr} {home_score}",
-            'Total Runs': str(total_reel),
-            'Home Runs': _formater_cellule_hr(away_abbr, hr_away, home_abbr, hr_home),
+            'Total Runs': _formater_cellule_total_runs(
+                total_reel, away_abbr, runs_away, home_abbr, runs_home
+            ),
+            'HR marqués': _formater_cellule_hr(away_abbr, hr_away, home_abbr, hr_home),
             'Vainqueur': _formater_vainqueur(home_nick, away_nick, home_score, away_score),
             'Victoire prédite': texte_victoire,
             'Over/Under prédit': texte_ou,
-            'HR surveillés': texte_hr,
-            'Bilan': f"Victoire {icone_victoire} · Over/Under {icone_ou} · HR {icone_hr}",
+            'Bilan': f"Victoire {icone_victoire} · Over/Under {icone_ou}",
         })
 
     return pd.DataFrame(lignes), None, predictions_disponibles
@@ -2212,13 +2274,12 @@ def afficher_bilan_predictions_veille(annee: int):
             "Match": st.column_config.TextColumn("Match", width="medium"),
             "Statut": st.column_config.TextColumn("Statut", width="small"),
             "Score": st.column_config.TextColumn("Score", width="small"),
-            "Total Runs": st.column_config.TextColumn("Total Runs", width="small"),
-            "Home Runs": st.column_config.TextColumn("Home Runs", width="large"),
+            "Total Runs": st.column_config.TextColumn("Total Runs", width="large"),
+            "HR marqués": st.column_config.TextColumn("HR marqués", width="large"),
             "Vainqueur": st.column_config.TextColumn("Vainqueur", width="medium"),
             "Victoire prédite": st.column_config.TextColumn("Victoire prédite", width="large"),
             "Over/Under prédit": st.column_config.TextColumn("Over/Under prédit", width="large"),
-            "HR surveillés": st.column_config.TextColumn("HR surveillés", width="large"),
-            "Bilan": st.column_config.TextColumn("Bilan", width="large"),
+            "Bilan": st.column_config.TextColumn("Bilan", width="medium"),
         },
         hide_index=True,
     )
@@ -2227,12 +2288,12 @@ def afficher_bilan_predictions_veille(annee: int):
         "**Méthodologie** — Victoire : ✅ si l'équipe favorite (probabilité la plus haute) a "
         "réellement gagné. Over/Under : ligne de référence = moyenne réelle de runs cumulés par "
         "match sur la saison en cours ; ✅ si notre projection (moyenne de runs des 10 derniers "
-        "matchs des deux équipes) était du même côté de cette ligne que le résultat réel. HR : ✅ "
-        "si au moins un des joueurs les plus en forme au HR (10 derniers matchs) de chaque équipe "
-        "a effectivement frappé un home run dans ce match. ⏳ = aucune prédiction n'avait été "
-        "archivée pour ce match (application non consultée la veille) ou match nul. Les "
-        "prédictions ne sont archivées qu'au moment où l'onglet Résumé ou Hot Pronostics est "
-        "consulté ce jour-là (pas de calcul en tâche de fond)."
+        "matchs des deux équipes) était du même côté de cette ligne que le résultat réel. "
+        "Total Runs / HR marqués : détail des joueurs ayant réellement marqué, issu du "
+        "boxscore officiel. ⏳ = aucune prédiction n'avait été archivée pour ce match "
+        "(application non consultée la veille) ou match nul. Les prédictions ne sont "
+        "archivées qu'au moment où l'onglet Résumé ou Hot Pronostics est consulté ce "
+        "jour-là (pas de calcul en tâche de fond)."
     )
 
 
