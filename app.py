@@ -2202,61 +2202,14 @@ with onglets[2]:
     # ----- Fin de la nouvelle logique HR équipe via MLB StatsAPI ------
 
     st.markdown("---")
-    st.subheader("📈 Tendance des Runs par match (score équipe)")
-    # 2. Graphique tendance Runs, avec ligne de moyenne annotée
-    try:
-        if not df_matchs.empty and "R" in df_matchs.columns:
-            df_matchs = df_matchs.copy()
-            df_matchs['Runs'] = pd.to_numeric(df_matchs['R'], errors='coerce')
-            df_matchs = df_matchs.dropna(subset=['Runs'])
-            # Ajouter un numéro de match croissant
-            df_matchs = df_matchs.reset_index(drop=True)
-            df_matchs['Match_Num'] = df_matchs.index + 1
 
-            if not df_matchs.empty:
-                moyenne_runs = df_matchs['Runs'].mean()
-
-                ligne_runs = alt.Chart(df_matchs).mark_line(
-                    point=True, color='#1f77b4'
-                ).encode(
-                    x=alt.X('Match_Num:Q', title='Numéro du match'),
-                    y=alt.Y('Runs:Q', title='Runs marqués'),
-                    tooltip=[
-                        alt.Tooltip('Match_Num:Q', title='Match #'),
-                        alt.Tooltip('Runs:Q', title='Runs')
-                    ]
-                )
-
-                ligne_moyenne = alt.Chart(pd.DataFrame({'moyenne': [moyenne_runs]})).mark_rule(
-                    color='red', strokeDash=[6, 4], size=2
-                ).encode(
-                    y=alt.Y('moyenne:Q'),
-                    tooltip=[alt.Tooltip('moyenne:Q', title='Moyenne', format='.2f')]
-                )
-
-                annotation_moyenne = alt.Chart(pd.DataFrame({
-                    'moyenne': [moyenne_runs],
-                    'x': [df_matchs['Match_Num'].max()]
-                })).mark_text(
-                    text=f"Moyenne : {moyenne_runs:.2f}",
-                    align='right',
-                    baseline='bottom',
-                    dx=-4,
-                    dy=-6,
-                    color='red',
-                    fontWeight='bold'
-                ).encode(
-                    x=alt.X('x:Q'),
-                    y=alt.Y('moyenne:Q')
-                )
-
-                st.altair_chart(ligne_runs + ligne_moyenne + annotation_moyenne)
-            else:
-                st.info("Pas de données de runs disponibles pour cette équipe/saison.")
-        else:
-            st.info("Pas de données de runs disponibles pour cette équipe/saison.")
-    except Exception as e:
-        st.info(f"Erreur lors de l'affichage des tendances de runs : {e}")
+    # --------------------------------------------------------------------
+    # Graphique "Tendance des Runs par match (score équipe)" retiré pour
+    # épurer l'onglet et gagner de la place. Les autres éléments (moyenne
+    # de runs par match, sluggers récurrents, etc.) restent inchangés
+    # ci-dessous. Voir l'historique git pour retrouver le code d'origine
+    # si besoin de le réintroduire.
+    # --------------------------------------------------------------------
 
     # Statistiques synthétiques en haut
     if not df_matchs.empty and 'R' in df_matchs.columns:
