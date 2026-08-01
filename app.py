@@ -2218,7 +2218,6 @@ def construire_bilan_veille(annee: int):
 
         lignes.append({
             'Match': f"{away_nick} vs {home_nick}",
-            'Statut': "Terminé",
             'Score': f"{away_abbr} {away_score} - {home_abbr} {home_score}",
             'Total Runs': _formater_cellule_total_runs(
                 total_reel, away_abbr, runs_away, home_abbr, runs_home
@@ -2272,7 +2271,6 @@ def afficher_bilan_predictions_veille(annee: int):
         df_bilan,
         column_config={
             "Match": st.column_config.TextColumn("Match", width="medium"),
-            "Statut": st.column_config.TextColumn("Statut", width="small"),
             "Score": st.column_config.TextColumn("Score", width="small"),
             "Total Runs": st.column_config.TextColumn("Total Runs", width="large"),
             "HR marqués": st.column_config.TextColumn("HR marqués", width="large"),
