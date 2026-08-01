@@ -906,6 +906,146 @@ def predire_joueurs_du_jour(cumul_runs_10, cumul_hr_10, stats_lanceur_adverse, t
     return resultats[:top_n]
 
 
+# --------------------------------------------------------------
+# SEUILS DE PRÉDICTION PAR LIGUE ("Recommandation de Pari Optimisée")
+# --------------------------------------------------------------
+# Les moyennes offensives et l'ERA "normal" diffèrent fortement d'une ligue à l'autre
+# (ex: la MLB est réputée plus équilibrée/offensive que la NPB ou la KBO). Centraliser
+# ces seuils dans un dictionnaire clé = code ligue permet à `generer_recommandation_pari`
+# de s'adapter automatiquement à la ligue du match en cours (voir `detecter_ligue_match`),
+# sans jamais coder les seuils MLB "en dur" dans la logique elle-même - une future
+# extension multi-ligues (ex: import des apps NPB/KBO dans ce même projet) n'aurait
+# qu'à ajouter une entrée ici.
+LIGUE_PAR_DEFAUT = 'MLB'
+
+SEUILS_PARIS_PAR_LIGUE = {
+    'MLB': {
+        # ERA d'un lanceur partant jugé "battable" (favorise un pari Over)
+        'era_mauvais': 4.50,
+        # ERA d'un lanceur partant jugé dominant (favorise un pari Under)
+        'era_excellent': 3.50,
+        # Total de runs (des deux équipes cumulé) au-delà duquel on considère la
+        # tendance du match comme offensive (MLB = ligue équilibrée/offensive,
+        # seuil plus haut qu'en NPB/KBO par exemple)
+        'runs_total_haut': 9.0,
+    },
+}
+
+
+def detecter_ligue_match(match_du_jour: dict = None) -> str:
+    """
+    Détecte la ligue du match en cours à partir des infos du match (`obtenir_match_du_jour`),
+    afin que `generer_recommandation_pari` applique les bons seuils ERA/Runs (voir
+    `SEUILS_PARIS_PAR_LIGUE`). Cette application ne couvre aujourd'hui que la MLB
+    (source de données unique : MLB StatsAPI), donc le résultat vaut toujours 'MLB' en
+    pratique - mais la détection passe bien par le champ `ligue` du match (plutôt
+    qu'un `LIGUE_PAR_DEFAUT` codé en dur dans l'appelant), pour que la logique reste
+    correcte sans modification si l'app venait à couvrir plusieurs ligues (ex: KBO, NPB).
+    """
+    if match_du_jour and match_du_jour.get('ligue'):
+        return match_du_jour['ligue']
+    return LIGUE_PAR_DEFAUT
+
+
+def generer_recommandation_pari(
+    pct_nous,
+    pct_adverse,
+    stats_lanceur_nous,
+    stats_lanceur_adverse,
+    prediction_runs,
+    joueurs_a_surveiller,
+    ligue: str = None,
+    vent_defavorable: bool = False,
+):
+    """
+    Génère la "Recommandation de Pari Optimisée" affichée sous la ligne principale de
+    prédiction (probabilité de victoire) de l'onglet "Prédictions du jour", via un petit
+    arbre de décision qui croise plusieurs facteurs déjà calculés ailleurs dans l'onglet.
+    Objectif affiché à l'utilisateur : minimiser le risque, pas maximiser le gain.
+
+    --- Étape 1 : Risque sur le résultat (Win/Loss) - universel, toutes ligues ---
+    Si l'écart entre les deux probabilités de victoire est inférieur à 10 points, le
+    match est jugé "à Haut Risque" sur le vainqueur : on recommande de préférer un pari
+    sur les runs plutôt que sur le résultat (moins dépendant d'un seul évènement).
+
+    --- Étape 2 : Total de runs (Over/Under) - seuils spécifiques à la ligue ---
+    Seuils lus dans `SEUILS_PARIS_PAR_LIGUE[ligue]` (repli sur `LIGUE_PAR_DEFAUT` si la
+    ligue est inconnue) :
+      - Condition "tendance haute" (Over) : les DEUX lanceurs partants prévus ont un
+        ERA supérieur au seuil "mauvais ERA" de la ligue, OU le total de runs estimé du
+        match dépasse le seuil "runs haut" de la ligue.
+      - Condition "tendance basse" (Under) : les DEUX lanceurs ont un ERA inférieur au
+        seuil "excellent ERA" de la ligue, OU le vent est défavorable aux frappeurs
+        (facteur météo optionnel, non disponible aujourd'hui côté MLB StatsAPI - prévu
+        pour une future intégration, `vent_defavorable=False` par défaut).
+      La ligne de total proposée est décalée de 1.5 run (arrondi au 0,5 le plus proche)
+      DANS LE SENS QUI RÉDUIT LE RISQUE : en dessous de l'estimation pour un Over, au-dessus
+      pour un Under, pour se laisser une marge plutôt que de parier pile sur l'estimation brute.
+
+    --- Étape 3 : Option joueur (HR/Run) - universel ---
+    Si un joueur du module "Prédiction des Joueurs" (nos sluggers en forme du jour,
+    `joueurs_a_surveiller`) ressort avec une confiance au moins "Moyenne", il est proposé
+    comme option alternative de pari.
+
+    Retourne une liste de phrases (str), dans l'ordre ci-dessus, prête à être jointe et
+    affichée dans un seul encart (ex: `st.info`). Liste vide si aucune recommandation
+    n'a pu être formulée (données insuffisantes).
+    """
+    ligue = ligue or LIGUE_PAR_DEFAUT
+    seuils = SEUILS_PARIS_PAR_LIGUE.get(ligue, SEUILS_PARIS_PAR_LIGUE[LIGUE_PAR_DEFAUT])
+
+    def _arrondir_au_demi(valeur: float) -> float:
+        """Arrondit au 0,5 le plus proche (ex: 8.2 -> 8.0, 8.3 -> 8.5)."""
+        return round(valeur * 2) / 2
+
+    def _era(stats):
+        return stats['era'] if stats and stats.get('era') else None
+
+    conseils = []
+
+    # --- Étape 1 : risque Win/Loss (universel) ---
+    if pct_nous is not None and pct_adverse is not None:
+        if abs(pct_nous - pct_adverse) < 10:
+            conseils.append(
+                "⚠️ Match serré (Haut Risque sur la victoire). Privilégiez un pari sur "
+                "les Runs plutôt que sur le vainqueur."
+            )
+
+    # --- Étape 2 : total de runs Over/Under (spécifique à la ligue) ---
+    era_nous = _era(stats_lanceur_nous)
+    era_adverse = _era(stats_lanceur_adverse)
+    deux_lanceurs_connus = era_nous is not None and era_adverse is not None
+
+    deux_mauvais_era = deux_lanceurs_connus and era_nous > seuils['era_mauvais'] and era_adverse > seuils['era_mauvais']
+    deux_excellents_era = deux_lanceurs_connus and era_nous < seuils['era_excellent'] and era_adverse < seuils['era_excellent']
+
+    total_runs_estime = prediction_runs.get('total_match') if prediction_runs else None
+    tendance_offensive_runs = total_runs_estime is not None and total_runs_estime > seuils['runs_total_haut']
+
+    if total_runs_estime is not None:
+        if deux_mauvais_era or tendance_offensive_runs:
+            ligne_over = _arrondir_au_demi(total_runs_estime - 1.5)
+            conseils.append(
+                f"📈 Tendance offensive forte. Conseil : Jouer 'Over {ligne_over} runs'."
+            )
+        elif deux_excellents_era or vent_defavorable:
+            ligne_under = _arrondir_au_demi(total_runs_estime + 1.5)
+            conseils.append(
+                f"📉 Match très défensif anticipé. Conseil : Jouer 'Under {ligne_under} runs'."
+            )
+
+    # --- Étape 3 : option joueur (universel) ---
+    if joueurs_a_surveiller:
+        meilleur_joueur = joueurs_a_surveiller[0]
+        if meilleur_joueur.get('confiance') in ('Élevée', 'Moyenne'):
+            conseils.append(
+                f"🎯 Option alternative : {meilleur_joueur['nom']} a une forte probabilité "
+                "de marquer un Run/HR aujourd'hui."
+            )
+
+    return conseils
+
+
 # ============================================================
 # 3 bis. "HOT PRONOSTICS" - Scan GLOBAL de tous les matchs du jour
 # ============================================================
@@ -2432,6 +2572,38 @@ with onglets[3]:
                 st.metric(f"{match_du_jour['adversaire']}", f"{pct_adverse:.0f}%")
             st.progress(pct_nous / 100)
 
+            # --------------------------------------------------------------
+            # RECOMMANDATION DE PARI OPTIMISÉE
+            # --------------------------------------------------------------
+            # Calculées ici (plutôt que dans leurs modules respectifs plus bas) pour
+            # pouvoir alimenter la recommandation juste en dessous de la ligne
+            # principale de prédiction (probabilité de victoire) ; les modules
+            # "Prédiction des Runs" et "Prédiction des Joueurs" plus bas réutilisent
+            # directement ces mêmes résultats (pas de recalcul, ni d'appel réseau
+            # supplémentaire - ce sont de simples fonctions locales).
+            prediction_runs = (
+                predire_runs_match(moyenne_runs_10, moyenne_ra_10, stats_lanceur_adverse)
+                if moyenne_runs_10 is not None else None
+            )
+            joueurs_a_surveiller = predire_joueurs_du_jour(
+                cumul_runs_10, cumul_hr_10, stats_lanceur_adverse, top_n=3
+            )
+
+            conseils_paris = generer_recommandation_pari(
+                pct_nous,
+                pct_adverse,
+                stats_lanceur_nous,
+                stats_lanceur_adverse,
+                prediction_runs,
+                joueurs_a_surveiller,
+                ligue=detecter_ligue_match(match_du_jour),
+            )
+            if conseils_paris:
+                st.info(
+                    "**💡 Recommandation de Pari Optimisée**\n\n"
+                    + "\n\n".join(conseils_paris)
+                )
+
             st.caption(
                 "Estimation basée sur (1) l'ERA/WHIP des lanceurs partants prévus des deux "
                 "équipes (facteur principal), (2) la moyenne de runs marqués/concédés sur les "
@@ -2455,11 +2627,11 @@ with onglets[3]:
             st.markdown("---")
             st.subheader("📊 Module de prédiction des Runs")
 
-            if moyenne_runs_10 is None:
+            # `prediction_runs` a déjà été calculé plus haut, avant la
+            # "Recommandation de Pari Optimisée" (voir commentaire à cet endroit).
+            if prediction_runs is None:
                 st.info("Pas assez de données récentes pour estimer les runs de cette équipe.")
             else:
-                prediction_runs = predire_runs_match(moyenne_runs_10, moyenne_ra_10, stats_lanceur_adverse)
-
                 col_pred1, col_pred2, col_pred3 = st.columns(3)
                 with col_pred1:
                     st.metric(
@@ -2484,10 +2656,8 @@ with onglets[3]:
             st.markdown("---")
             st.subheader("🎯 Module de prédiction des Joueurs (HR / Runs)")
 
-            joueurs_a_surveiller = predire_joueurs_du_jour(
-                cumul_runs_10, cumul_hr_10, stats_lanceur_adverse, top_n=3
-            )
-
+            # `joueurs_a_surveiller` a déjà été calculé plus haut, avant la
+            # "Recommandation de Pari Optimisée" (voir commentaire à cet endroit).
             if not joueurs_a_surveiller:
                 st.info(
                     "Pas assez de données de forme récente (runs/HR sur les 10 derniers matchs) "
