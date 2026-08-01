@@ -15,7 +15,10 @@ import pandas as pd             # Manipulation de données (tableaux)
 import altair as alt            # Graphiques avancés (ligne de moyenne annotée)
 import re                       # Extraction des noms/runs dans les cellules "Joueurs (Runs)"
 import time                     # Délais/backoff entre les appels API
-from datetime import datetime   # Gestion des dates
+import json                     # Sérialisation de l'historique des prédictions (bilan de la veille)
+import os                       # Chemin du fichier local d'historique des prédictions
+import requests                 # Appels directs à l'API GitHub Gist (persistance de l'historique)
+from datetime import datetime, timedelta  # Gestion des dates (timedelta : calcul de "hier")
 from zoneinfo import ZoneInfo   # Gestion des fuseaux horaires (heure US <-> heure française)
 
 import statsapi                 # Utilisation de l'API MLB
@@ -31,6 +34,38 @@ TZ_PARIS = ZoneInfo("Europe/Paris")
 # l'heure du serveur/de l'utilisateur : la saison MLB est définie en heure US, donc
 # utiliser une autre référence pourrait décaler l'année d'un jour près du Nouvel An.
 ANNEE_COURANTE = datetime.now(TZ_US_EASTERN).year
+
+# ------------------------------------------------------------------------------
+# Persistance de l'historique des prédictions (pour le "Bilan des Prédictions" de la
+# veille, onglet Résumé) : un instantané des prédictions du jour ("Hot Pronostics")
+# est archivé chaque jour, pour pouvoir être comparé au résultat réel le lendemain.
+#
+# Streamlit Community Cloud utilise un système de fichiers ÉPHÉMÈRE : tout fichier
+# écrit localement pendant l'exécution est PERDU à chaque redéploiement (déclenché par
+# un `git push`) ou "réveil" de l'app après une période d'inactivité. Un simple fichier
+# local ne suffit donc pas à conserver l'historique dans la durée sur cet hébergement.
+#
+# La source de vérité est donc un Gist GitHub PRIVÉ (persiste indéfiniment, quel que
+# soit le nombre de redéploiements), configuré via `st.secrets` :
+#
+#     [github]
+#     token = "ghp_..."   # Personal Access Token GitHub, scope "gist" UNIQUEMENT
+#     gist_id = "..."     # ID du Gist privé contenant historique_predictions_mlb.json
+#
+# à renseigner dans `.streamlit/secrets.toml` en local, et dans les "Secrets" de l'app
+# sur share.streamlit.io en production (jamais commités : `.streamlit/secrets.toml`
+# est listé dans `.gitignore`).
+#
+# Si ces secrets ne sont pas configurés (ex: tout premier lancement, développement
+# local sans Gist créé), l'application se rabat silencieusement sur le fichier local
+# ci-dessous - fonctionnel, mais non persistant sur Streamlit Cloud. Ce fichier local
+# sert aussi de cache accessoire même quand le Gist est configuré (repli en cas de
+# panne réseau GitHub ponctuelle).
+# ------------------------------------------------------------------------------
+NOM_FICHIER_HISTORIQUE_PREDICTIONS = "historique_predictions_mlb.json"
+CHEMIN_HISTORIQUE_PREDICTIONS = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), NOM_FICHIER_HISTORIQUE_PREDICTIONS
+)
 
 
 def appeler_avec_retry(fonction, *args, tentatives: int = 3, delai_base: float = 0.5, **kwargs):
@@ -58,6 +93,111 @@ def appeler_avec_retry(fonction, *args, tentatives: int = 3, delai_base: float =
             if tentative < tentatives:
                 time.sleep(delai_base * (2 ** (tentative - 1)))  # 0.5s, 1s, 2s, ...
     raise derniere_erreur
+
+
+def _obtenir_config_github():
+    """
+    Lit la configuration GitHub (token + ID du Gist privé) dans `st.secrets`, utilisée
+    pour la persistance durable de l'historique des prédictions (cf. commentaire au-
+    dessus de `CHEMIN_HISTORIQUE_PREDICTIONS`). Retourne (token, gist_id), ou
+    (None, None) si non configuré - jamais d'exception : accéder à `st.secrets` lève
+    une erreur s'il n'existe AUCUN fichier `secrets.toml` du tout (cas du tout premier
+    lancement / développement local sans Gist configuré), qu'il faut absorber ici pour
+    retomber sur le fichier local en toute transparence.
+    """
+    try:
+        conf = st.secrets.get("github", {})
+        return conf.get("token"), conf.get("gist_id")
+    except Exception:
+        return None, None
+
+
+def _charger_historique_predictions() -> dict:
+    """
+    Charge l'historique des prédictions archivées (un instantané par date, au format
+    {'AAAA-MM-JJ': {'sauvegarde_le': ..., 'matches': [...]}}) - en PRIORITÉ depuis le
+    Gist GitHub privé configuré (`_obtenir_config_github`), seule source qui survit aux
+    redéploiements sur Streamlit Community Cloud. Repli sur le fichier local
+    `CHEMIN_HISTORIQUE_PREDICTIONS` si le Gist n'est pas configuré, ou si l'appel à
+    l'API GitHub échoue (panne réseau ponctuelle, token invalide, etc.).
+
+    Retourne un dict vide si aucune des deux sources n'est disponible (ex: tout premier
+    lancement de l'application) - ne doit jamais faire planter l'application.
+    """
+    token, gist_id = _obtenir_config_github()
+    if token and gist_id:
+        try:
+            reponse = requests.get(
+                f"https://api.github.com/gists/{gist_id}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                timeout=10,
+            )
+            reponse.raise_for_status()
+            fichier = reponse.json().get("files", {}).get(NOM_FICHIER_HISTORIQUE_PREDICTIONS)
+            if fichier and fichier.get("content"):
+                return json.loads(fichier["content"])
+            return {}
+        except Exception:
+            pass  # repli silencieux sur le fichier local ci-dessous
+
+    try:
+        with open(CHEMIN_HISTORIQUE_PREDICTIONS, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _sauvegarder_predictions_du_jour(date_str: str, matches_snapshot: list) -> None:
+    """
+    Archive l'instantané des prédictions du jour (`matches_snapshot`) sous la clé
+    `date_str`, à la fois dans le Gist GitHub privé configuré (source durable, cf.
+    `_obtenir_config_github`) ET dans le fichier local (repli/cache accessoire).
+    Appelée depuis `construire_donnees_hot_pronostics` (donc au maximum une fois
+    toutes les 30 min, son propre `ttl` de cache) : écrire à chaque appel écrase
+    simplement l'instantané du jour par la version la plus à jour (utile si les
+    lineups/lanceurs annoncés changent en cours de journée), ce qui est le
+    comportement recherché.
+
+    Purge au passage les entrées de plus de 30 jours, pour que l'historique ne
+    grossisse pas indéfiniment au fil des mois. Ne lève jamais d'exception : la
+    sauvegarde de l'historique est un "bonus" (bilan de la veille) qui ne doit jamais
+    faire planter le calcul des prédictions du jour lui-même en cas de souci réseau ou
+    d'écriture disque (permissions, disque plein, filesystem éphémère, etc.).
+    """
+    try:
+        historique = _charger_historique_predictions()
+        historique[date_str] = {
+            'sauvegarde_le': datetime.now(TZ_US_EASTERN).isoformat(),
+            'matches': matches_snapshot,
+        }
+        date_limite = (datetime.now(TZ_US_EASTERN) - timedelta(days=30)).strftime('%Y-%m-%d')
+        historique = {d: v for d, v in historique.items() if d >= date_limite}
+        contenu_json = json.dumps(historique, ensure_ascii=False, indent=2)
+
+        token, gist_id = _obtenir_config_github()
+        if token and gist_id:
+            try:
+                reponse = requests.patch(
+                    f"https://api.github.com/gists/{gist_id}",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                    },
+                    json={"files": {NOM_FICHIER_HISTORIQUE_PREDICTIONS: {"content": contenu_json}}},
+                    timeout=10,
+                )
+                reponse.raise_for_status()
+            except Exception:
+                pass  # au pire, le fichier local ci-dessous prend seul le relais
+
+        with open(CHEMIN_HISTORIQUE_PREDICTIONS, "w", encoding="utf-8") as f:
+            f.write(contenu_json)
+    except Exception:
+        pass
+
 
 # ============================================================
 # 2. CONFIGURATION DE LA PAGE - Paramètres de l'application
@@ -1071,6 +1211,34 @@ def _calculer_top5_runs(candidats: list) -> pd.DataFrame:
     ]]
 
 
+def _total_runs_predit(moyenne_home, moyenne_away):
+    """
+    Total de runs projeté pour un match = somme des moyennes de runs marqués par
+    chaque équipe sur ses 10 derniers matchs (`obtenir_moyennes_runs_recentes_toutes_equipes`).
+    Sert de projection "Over/Under" dans le bilan des prédictions de la veille (cf.
+    `obtenir_ligne_over_under_saison`). Retourne None si l'une des deux moyennes n'est
+    pas disponible.
+    """
+    if moyenne_home is None or moyenne_away is None or pd.isna(moyenne_home) or pd.isna(moyenne_away):
+        return None
+    return round(float(moyenne_home) + float(moyenne_away), 2)
+
+
+def _top_candidats_hr_match(candidats_hr: list, equipe_nom: str, adversaire_nom: str, n: int = 2) -> list:
+    """
+    Les `n` joueurs les plus en forme au HR (10 derniers matchs) d'une équipe, pour un
+    match donné, à partir de la liste `candidats_hr` déjà construite dans
+    `construire_donnees_hot_pronostics` (filtrée par nom d'équipe ET d'adversaire pour
+    rester robuste aux doubles programmes / homonymies improbables).
+    """
+    pertinents = [
+        c for c in candidats_hr
+        if c.get('Équipe') == equipe_nom and c.get('Adversaire') == adversaire_nom
+    ]
+    pertinents_tries = sorted(pertinents, key=lambda c: c.get('HR (10 derniers matchs)', 0), reverse=True)
+    return [c['Joueur'] for c in pertinents_tries[:n]]
+
+
 @st.cache_data(show_spinner=False, ttl=1800)
 def construire_donnees_hot_pronostics(annee: int):
     """
@@ -1168,6 +1336,30 @@ def construire_donnees_hot_pronostics(annee: int):
     df_top5_hr = _calculer_top5_home_runs(candidats_hr)
     df_top5_runs = _calculer_top5_runs(candidats_runs)
     df_victoires = pd.DataFrame(lignes_victoire)
+
+    # --- Archivage de l'instantané du jour (pour le "Bilan des Prédictions" de la
+    # veille, onglet Résumé, cf. `_sauvegarder_predictions_du_jour`) : on ne conserve
+    # que ce qui est nécessaire à une comparaison ultérieure avec le résultat réel une
+    # fois le match terminé (probabilité de victoire, total de runs projeté pour les
+    # deux équipes, et candidats HR les plus en forme de chaque équipe). Indexé par
+    # `game_id` (identifiant unique statsapi), plus fiable qu'un nom d'équipe en cas
+    # de double programme (doubleheader).
+    matches_snapshot = [
+        {
+            'game_id': m.get('game_id'),
+            'home_name': m['home_name'],
+            'away_name': m['away_name'],
+            'proba_home': ligne_victoire.get('Proba Domicile (%)'),
+            'proba_away': ligne_victoire.get('Proba Extérieur (%)'),
+            'total_runs_predit': _total_runs_predit(
+                moyennes_runs_equipes.get(m['home_id']), moyennes_runs_equipes.get(m['away_id'])
+            ),
+            'candidats_hr_home': _top_candidats_hr_match(candidats_hr, m['home_name'], m['away_name']),
+            'candidats_hr_away': _top_candidats_hr_match(candidats_hr, m['away_name'], m['home_name']),
+        }
+        for m, ligne_victoire in zip(matchs_du_jour, lignes_victoire)
+    ]
+    _sauvegarder_predictions_du_jour(datetime.now(TZ_US_EASTERN).strftime('%Y-%m-%d'), matches_snapshot)
 
     return matchs_du_jour, df_top5_hr, df_top5_runs, df_victoires
 
@@ -1429,14 +1621,284 @@ def construire_resume_matchs_du_jour(annee: int, cache_bust: int = 0):
     return pd.DataFrame(lignes), None
 
 
+# ------------------------------------------------------------------------------
+# BILAN DES PRÉDICTIONS DE LA VEILLE (menu déroulant en tête de l'onglet "Résumé")
+# ------------------------------------------------------------------------------
+# statsapi ne publie aucune ligne de paris officielle (contrairement aux sites de
+# paris sportifs) : à défaut, la "ligne" Over/Under utilisée ci-dessous pour qualifier
+# un match de "à forte marque" (Over) ou "à faible marque" (Under) est la moyenne
+# réelle de runs cumulés (les deux équipes confondues) sur tous les matchs déjà joués
+# cette saison - la référence la plus neutre et la plus objective disponible sans
+# source de paris tierce.
+@st.cache_data(show_spinner=False, ttl=3600)
+def obtenir_ligne_over_under_saison(annee: int) -> float:
+    """
+    Moyenne de runs totaux (2 équipes cumulées) sur tous les matchs MLB déjà joués
+    cette saison, tous équipes confondues - sert de ligne de référence Over/Under pour
+    le bilan des prédictions de la veille. Repli à 8.5 (ordre de grandeur usuel en MLB)
+    si aucune donnée n'est encore disponible (tout début de saison).
+    """
+    date_debut = f"{annee}-03-01"
+    date_fin = datetime.now(TZ_US_EASTERN).strftime('%Y-%m-%d')
+    try:
+        matchs = appeler_avec_retry(
+            statsapi.schedule, start_date=date_debut, end_date=date_fin, sportId=1
+        )
+    except Exception:
+        return 8.5
+
+    totaux = []
+    for g in matchs:
+        if g.get('status') != 'Final':
+            continue
+        home_score, away_score = g.get('home_score'), g.get('away_score')
+        if home_score is None or away_score is None:
+            continue
+        try:
+            totaux.append(int(home_score) + int(away_score))
+        except (TypeError, ValueError):
+            continue
+
+    if not totaux:
+        return 8.5
+    return round(sum(totaux) / len(totaux), 2)
+
+
+def _formater_vainqueur(nom_home: str, nom_away: str, home_score: int, away_score: int) -> str:
+    """Nom de l'équipe gagnante, ou 'Match nul' (cas très rare en MLB - matchs suspendus/annulés à égalité)."""
+    if home_score == away_score:
+        return "Match nul"
+    return nom_home if home_score > away_score else nom_away
+
+
+def _bilan_victoire(proba_home, proba_away, nom_home: str, nom_away: str, home_score: int, away_score: int):
+    """Retourne (texte, icône) comparant l'équipe favorite annoncée hier à la gagnante réelle."""
+    if proba_home is None or proba_away is None or pd.isna(proba_home) or pd.isna(proba_away):
+        return "Prédiction non disponible", "⏳"
+    if home_score == away_score:
+        return "Match nul (pas de favori confirmé)", "⏳"
+    favori = nom_home if proba_home >= proba_away else nom_away
+    pct_favori = max(proba_home, proba_away)
+    gagnant = nom_home if home_score > away_score else nom_away
+    icone = "✅" if favori == gagnant else "❌"
+    return f"{favori} favori à {pct_favori:.0f}% → vainqueur : {gagnant}", icone
+
+
+def _bilan_over_under(total_runs_predit, total_runs_reel: int, ligne: float):
+    """Retourne (texte, icône) comparant la projection Over/Under d'hier au total réel."""
+    if total_runs_predit is None:
+        return "Prédiction non disponible", "⏳"
+    direction_predite = "Over" if total_runs_predit > ligne else "Under"
+    direction_reelle = "Over" if total_runs_reel > ligne else "Under"
+    icone = "✅" if direction_predite == direction_reelle else "❌"
+    return (
+        f"{direction_predite} annoncé (projection {total_runs_predit:.1f}, ligne {ligne:.1f}) "
+        f"→ réel {total_runs_reel} ({direction_reelle})"
+    ), icone
+
+
+def _bilan_hr(candidats_home: list, candidats_away: list, hr_home_reels: list, hr_away_reels: list):
+    """Retourne (texte, icône) : au moins un des joueurs surveillés hier a-t-il réellement frappé un HR ?"""
+    candidats = [c for c in (candidats_home or []) + (candidats_away or []) if c]
+    if not candidats:
+        return "Prédiction non disponible", "⏳"
+    scoreurs_reels = {nom for nom, _ in hr_home_reels} | {nom for nom, _ in hr_away_reels}
+    touches = [c for c in candidats if c in scoreurs_reels]
+    icone = "✅" if touches else "❌"
+    texte = f"Surveillés : {', '.join(candidats)}"
+    if touches:
+        texte += f" → a frappé : {', '.join(touches)}"
+    return texte, icone
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def construire_bilan_veille(annee: int):
+    """
+    Construit le tableau "Résultats de la veille et Bilan des Prédictions" : reprend
+    la structure du tableau des matchs du jour (`construire_resume_matchs_du_jour`),
+    mais pour la date d'HIER (heure US, Est) et avec les matchs forcément terminés,
+    enrichi de colonnes de bilan comparant la prédiction sauvegardée hier
+    (`_sauvegarder_predictions_du_jour`, appelée automatiquement depuis
+    `construire_donnees_hot_pronostics`) au résultat réel.
+
+    Comme cette fonction n'est appelée QUE lorsque l'utilisateur ouvre le menu
+    déroulant (cf. `afficher_bilan_predictions_veille`), elle n'a aucun coût au
+    chargement initial de l'onglet "Résumé".
+
+    Retourne (DataFrame, message_erreur, predictions_disponibles) :
+      - `predictions_disponibles` (bool) indique si UN AU MOINS instantané de
+        prédictions a été retrouvé pour la date d'hier - utilisé par
+        `afficher_bilan_predictions_veille` pour distinguer "aucune prédiction n'a
+        jamais été archivée pour cette date" (cas normal les tout premiers jours après
+        l'ajout de cette fonctionnalité, ou si l'app n'a pas été ouverte la veille) du
+        cas où le tableau est simplement vide pour une autre raison.
+    Sur le même modèle que `construire_resume_matchs_du_jour`, aucune exception n'est
+    jamais remontée à l'appelant.
+    """
+    hier_us = datetime.now(TZ_US_EASTERN) - timedelta(days=1)
+    date_hier_str = hier_us.strftime('%Y-%m-%d')
+
+    try:
+        matchs_hier = appeler_avec_retry(statsapi.schedule, date=date_hier_str, sportId=1)
+    except Exception as e:
+        return pd.DataFrame(), (
+            f"Impossible de récupérer les résultats d'hier pour le moment ({e}). "
+            "Réessayez en rouvrant ce menu dans quelques instants."
+        ), True
+
+    if not matchs_hier:
+        return pd.DataFrame(), None, True
+
+    try:
+        infos_equipes = get_team_id_vers_infos(annee)
+    except Exception:
+        infos_equipes = {}
+
+    predictions_hier = _charger_historique_predictions().get(date_hier_str, {}).get('matches', [])
+    predictions_disponibles = len(predictions_hier) > 0
+    predictions_par_game_id = {p.get('game_id'): p for p in predictions_hier}
+
+    ligne_ou = obtenir_ligne_over_under_saison(annee)
+
+    lignes = []
+    for g in matchs_hier:
+        if g.get('status') != 'Final':
+            continue
+        game_id = g.get('game_id')
+        info_home = infos_equipes.get(g.get('home_id'), {})
+        info_away = infos_equipes.get(g.get('away_id'), {})
+        home_nick = info_home.get('nickname') or g.get('home_name') or '?'
+        away_nick = info_away.get('nickname') or g.get('away_name') or '?'
+        home_abbr = info_home.get('abbr') or (home_nick[:3].upper() if home_nick else '???')
+        away_abbr = info_away.get('abbr') or (away_nick[:3].upper() if away_nick else '???')
+
+        try:
+            home_score = int(g.get('home_score'))
+            away_score = int(g.get('away_score'))
+        except (TypeError, ValueError):
+            continue
+        total_reel = home_score + away_score
+
+        hr_home = obtenir_hr_joueurs_match(game_id, True)
+        hr_away = obtenir_hr_joueurs_match(game_id, False)
+
+        pred = predictions_par_game_id.get(game_id)
+        candidats_hr_home = pred.get('candidats_hr_home', []) if pred else []
+        candidats_hr_away = pred.get('candidats_hr_away', []) if pred else []
+        proba_home = pred.get('proba_home') if pred else None
+        proba_away = pred.get('proba_away') if pred else None
+        total_predit = pred.get('total_runs_predit') if pred else None
+
+        texte_victoire, icone_victoire = _bilan_victoire(
+            proba_home, proba_away, home_nick, away_nick, home_score, away_score
+        )
+        texte_ou, icone_ou = _bilan_over_under(total_predit, total_reel, ligne_ou)
+        texte_hr, icone_hr = _bilan_hr(candidats_hr_home, candidats_hr_away, hr_home, hr_away)
+
+        lignes.append({
+            'Match': f"{away_nick} vs {home_nick}",
+            'Statut': "Terminé",
+            'Score': f"{away_abbr} {away_score} - {home_abbr} {home_score}",
+            'Total Runs': str(total_reel),
+            'Home Runs': _formater_cellule_hr(away_abbr, hr_away, home_abbr, hr_home),
+            'Vainqueur': _formater_vainqueur(home_nick, away_nick, home_score, away_score),
+            'Victoire prédite': texte_victoire,
+            'Over/Under prédit': texte_ou,
+            'HR surveillés': texte_hr,
+            'Bilan': f"Victoire {icone_victoire} · Over/Under {icone_ou} · HR {icone_hr}",
+        })
+
+    return pd.DataFrame(lignes), None, predictions_disponibles
+
+
+def afficher_bilan_predictions_veille(annee: int):
+    """
+    Corps du menu déroulant "📅 Résultats de la veille et Bilan des Prédictions" :
+    appelé uniquement quand ce menu est ouvert (cf. garde `expander.open` dans
+    `afficher_onglet_resume`), donc sans coût réseau tant que l'utilisateur ne l'a
+    pas déplié.
+    """
+    if annee != ANNEE_COURANTE:
+        st.info(
+            f"Le bilan de la veille n'est disponible que pour la saison en cours "
+            f"({ANNEE_COURANTE})."
+        )
+        return
+
+    with st.spinner("Récupération des résultats d'hier et calcul du bilan des prédictions..."):
+        df_bilan, message_erreur, predictions_disponibles = construire_bilan_veille(annee)
+
+    if message_erreur:
+        st.error(f"⚠️ {message_erreur}")
+        return
+
+    if df_bilan.empty:
+        st.info("Aucun match MLB terminé hier (heure US, Est).")
+        return
+
+    if not predictions_disponibles:
+        st.info(
+            "ℹ️ Aucune prédiction n'a été archivée hier pour ces matchs, donc les colonnes de "
+            "bilan ci-dessous affichent \"Prédiction non disponible\" - les résultats réels, eux, "
+            "sont bien à jour. Cela arrive si l'application n'a pas été consultée du tout hier "
+            "(l'archivage se fait uniquement à l'ouverture de l'onglet Résumé ou Hot Pronostics), "
+            "ou si cette fonctionnalité vient tout juste d'être ajoutée : le bilan se remplira "
+            "automatiquement à partir de demain."
+        )
+
+    st.dataframe(
+        df_bilan,
+        column_config={
+            "Match": st.column_config.TextColumn("Match", width="medium"),
+            "Statut": st.column_config.TextColumn("Statut", width="small"),
+            "Score": st.column_config.TextColumn("Score", width="small"),
+            "Total Runs": st.column_config.TextColumn("Total Runs", width="small"),
+            "Home Runs": st.column_config.TextColumn("Home Runs", width="large"),
+            "Vainqueur": st.column_config.TextColumn("Vainqueur", width="medium"),
+            "Victoire prédite": st.column_config.TextColumn("Victoire prédite", width="large"),
+            "Over/Under prédit": st.column_config.TextColumn("Over/Under prédit", width="large"),
+            "HR surveillés": st.column_config.TextColumn("HR surveillés", width="large"),
+            "Bilan": st.column_config.TextColumn("Bilan", width="large"),
+        },
+        hide_index=True,
+    )
+
+    st.caption(
+        "**Méthodologie** — Victoire : ✅ si l'équipe favorite (probabilité la plus haute) a "
+        "réellement gagné. Over/Under : ligne de référence = moyenne réelle de runs cumulés par "
+        "match sur la saison en cours ; ✅ si notre projection (moyenne de runs des 10 derniers "
+        "matchs des deux équipes) était du même côté de cette ligne que le résultat réel. HR : ✅ "
+        "si au moins un des joueurs les plus en forme au HR (10 derniers matchs) de chaque équipe "
+        "a effectivement frappé un home run dans ce match. ⏳ = aucune prédiction n'avait été "
+        "archivée pour ce match (application non consultée la veille) ou match nul. Les "
+        "prédictions ne sont archivées qu'au moment où l'onglet Résumé ou Hot Pronostics est "
+        "consulté ce jour-là (pas de calcul en tâche de fond)."
+    )
+
+
 @st.fragment
 def afficher_onglet_resume(annee: int):
     """
-    Corps de l'onglet "Résumé" (bouton de rafraîchissement + tableau), encapsulé dans
-    un `st.fragment` : cliquer sur le bouton ne relance QUE cette fonction (nouvel
-    appel API + reconstruction du tableau), sans recharger le reste de l'application
-    (sidebar, autres onglets) ni la page web entière.
+    Corps de l'onglet "Résumé" (menu déroulant "Bilan de la veille" + bouton de
+    rafraîchissement + tableau du jour), encapsulé dans un `st.fragment` : cliquer sur
+    le bouton, ou ouvrir/fermer le menu déroulant, ne relance QUE cette fonction, sans
+    recharger le reste de l'application (sidebar, autres onglets) ni la page web
+    entière.
     """
+    # --- Menu déroulant "Bilan des Prédictions" de la veille, tout en haut de
+    # l'onglet, au-dessus du tableau des matchs du jour. `on_change="rerun"` rend la
+    # propriété `.open` dynamique (True/False selon l'état du menu) : le contenu
+    # (requête réseau statsapi incluse) n'est donc calculé QUE si l'utilisateur a
+    # effectivement déplié le menu, jamais au chargement initial de l'onglet.
+    expander_veille = st.expander(
+        "📅 Résultats de la veille et Bilan des Prédictions", on_change="rerun"
+    )
+    if expander_veille.open:
+        with expander_veille:
+            afficher_bilan_predictions_veille(annee)
+
+    st.markdown("---")
+
     if 'resume_cache_bust' not in st.session_state:
         st.session_state.resume_cache_bust = 0
     if 'resume_derniere_actualisation' not in st.session_state:

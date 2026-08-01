@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+.venv/
+venv/
+.streamlit/secrets.toml
+.DS_Store
+historique_predictions_mlb.json
