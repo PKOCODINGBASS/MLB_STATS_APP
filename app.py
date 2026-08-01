@@ -2224,9 +2224,8 @@ def construire_bilan_veille(annee: int):
             ),
             'HR marqués': _formater_cellule_hr(away_abbr, hr_away, home_abbr, hr_home),
             'Vainqueur': _formater_vainqueur(home_nick, away_nick, home_score, away_score),
-            'Victoire prédite': texte_victoire,
-            'Over/Under prédit': texte_ou,
-            'Bilan': f"Victoire {icone_victoire} · Over/Under {icone_ou}",
+            'Victoire prédite': f"{icone_victoire} {texte_victoire}",
+            'Over/Under prédit': f"{icone_ou} {texte_ou}",
         })
 
     return pd.DataFrame(lignes), None, predictions_disponibles
@@ -2277,7 +2276,6 @@ def afficher_bilan_predictions_veille(annee: int):
             "Vainqueur": st.column_config.TextColumn("Vainqueur", width="medium"),
             "Victoire prédite": st.column_config.TextColumn("Victoire prédite", width="large"),
             "Over/Under prédit": st.column_config.TextColumn("Over/Under prédit", width="large"),
-            "Bilan": st.column_config.TextColumn("Bilan", width="medium"),
         },
         hide_index=True,
     )
