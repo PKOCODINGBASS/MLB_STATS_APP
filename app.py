@@ -2338,9 +2338,9 @@ def assembler_lignes_recap_hot_pronostics(
                 else:
                     value_kind, value_label = 'none', 'Pas de value'
 
-        total_proj = _total_runs_predit(
-            moyennes.get(m.get('home_id')), moyennes.get(m.get('away_id'))
-        )
+        runs_home = moyennes.get(m.get('home_id'))
+        runs_away = moyennes.get(m.get('away_id'))
+        total_proj = _total_runs_predit(runs_home, runs_away)
         classement_ou = classer_recommandation_totaux_over_under(total_proj, ligne_ou)
 
         reco_hr = _meilleure_reco_joueur_match(df_hr_all, home, away, 'Indice HR (/100)')
@@ -2355,6 +2355,10 @@ def assembler_lignes_recap_hot_pronostics(
             'value_label': value_label,
             'ou_kind': classement_ou['code'] if classement_ou else None,
             'ou_resume': classement_ou['resume'] if classement_ou else 'Projection indisponible',
+            'runs_away': None if runs_away is None or pd.isna(runs_away) else round(float(runs_away), 1),
+            'runs_home': None if runs_home is None or pd.isna(runs_home) else round(float(runs_home), 1),
+            'runs_away_label': away,
+            'runs_home_label': home,
             'reco_hr': (
                 f"{reco_hr['joueur']} ({reco_hr['equipe']})" if reco_hr and reco_hr.get('joueur') else None
             ),
@@ -2717,10 +2721,11 @@ with onglets[1]:
             else:
                 # --- Tableau de bord global : TOUT PREMIER élément de l'onglet ---
                 st.subheader("📋 Tableau de bord du jour")
-                afficher_tableau_recap_hot_pronostics(lignes_recap)
+                afficher_tableau_recap_hot_pronostics(lignes_recap, show_runs_equipes=True)
                 st.caption(
                     "Totaux (O/U) : somme des moyennes de runs marqués des 2 équipes (10 derniers matchs) "
-                    "vs ligne saison — même source que la Recommandation Totaux de Prédictions du jour."
+                    "vs ligne saison — même source que la Recommandation Totaux de Prédictions du jour. "
+                    "Runs / équipe : moyenne de runs marqués de chaque équipe sur ses 10 derniers matchs."
                 )
 
                 st.caption(
