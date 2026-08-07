@@ -2236,11 +2236,24 @@ def _noms_joueurs_correspondent(nom_predit: str, nom_reel: str) -> bool:
     return False
 
 
+def _nb_marque_joueur(nom_predit: str, scoreurs: list) -> int:
+    """Nombre marqué (runs ou HR) par un candidat dans la liste de scoreurs réels."""
+    for nom_reel, nb in scoreurs or []:
+        try:
+            n = int(nb or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0 and _noms_joueurs_correspondent(nom_predit, nom_reel):
+            return n
+    return 0
+
+
 def _bilan_joueurs_predits(candidats_home, candidats_away, scoreurs_home, scoreurs_away, label: str):
     """
     Retourne (texte, icône) pour les colonnes "HR prédit" / "Run prédit" du bilan :
     ✅ si au moins un candidat archivé apparaît parmi les scoreurs réels du match,
     ❌ si des candidats étaient archivés mais aucun n'a marqué, ⏳ sinon.
+    Les validés affichent le nombre réel (ex. `Judge (2 runs)`).
     """
     preds = []
     vus = set()
@@ -2253,14 +2266,82 @@ def _bilan_joueurs_predits(candidats_home, candidats_away, scoreurs_home, scoreu
         return "Prédiction non disponible", "⏳"
 
     scoreurs = list(scoreurs_home or []) + list(scoreurs_away or [])
-    valides = [
-        p for p in preds
-        if any(nb and _noms_joueurs_correspondent(p, nom_reel) for nom_reel, nb in scoreurs)
-    ]
+    unite = "HR" if label == "HR" else "run"
+    valides = []
+    for p in preds:
+        nb = _nb_marque_joueur(p, scoreurs)
+        if nb:
+            suffixe = unite if (label == "HR" or nb == 1) else "runs"
+            valides.append(f"{p} ({nb} {suffixe})")
     liste_pred = ", ".join(preds[:4])
     if valides:
-        return f"{label} : {liste_pred} → validés : {', '.join(valides)}", "✅"
-    return f"{label} : {liste_pred} → aucun validé", "❌"
+        return f"{liste_pred} → validés : {', '.join(valides)}", "✅"
+    return f"{liste_pred} → aucun validé", "❌"
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=100)
+def _backfill_candidats_runs_mlb(game_id: int, n: int = 2):
+    """
+    Rétrocompatibilité bilan : les instantanés antérieurs à l'ajout de `candidats_runs_*`
+    n'avaient que les HR. On reconstruit un top Run par équipe via l'OBP saison des
+    partants du boxscore (même signal principal que Hot Pronostics Runs).
+    Retourne (candidats_home, candidats_away).
+    """
+    if not game_id:
+        return [], []
+    try:
+        box = appeler_avec_retry(statsapi.boxscore_data, int(game_id))
+    except Exception:
+        return [], []
+
+    def _partants(batters):
+        joueurs = []
+        for b in batters or []:
+            pid = b.get('personId')
+            if not pid:
+                continue
+            try:
+                order = int(b.get('battingOrder') or 0)
+            except (TypeError, ValueError):
+                continue
+            # Partants : battingOrder 100, 200, … 900 (les remplaçants ont un reste ≠ 0).
+            if order < 100 or order % 100 != 0:
+                continue
+            joueurs.append((int(pid), b.get('name') or 'Inconnu', order))
+        joueurs.sort(key=lambda x: x[2])
+        return joueurs
+
+    home_j = _partants(box.get('homeBatters', []))
+    away_j = _partants(box.get('awayBatters', []))
+    ids = tuple(sorted({pid for pid, _, _ in home_j + away_j}))
+    if not ids:
+        return [], []
+    stats = obtenir_stats_batteurs_par_id(ids) or {}
+
+    def _top(joueurs):
+        ranks = []
+        for pid, nom, _ in joueurs:
+            s = stats.get(pid) or {}
+            obp = s.get('obp_saison')
+            if obp is None or (isinstance(obp, float) and pd.isna(obp)):
+                continue
+            ranks.append((nom, float(obp)))
+        ranks.sort(key=lambda x: x[1], reverse=True)
+        return [nom for nom, _ in ranks[:n]]
+
+    return _top(home_j), _top(away_j)
+
+
+def _candidats_runs_bilan(pred, game_id):
+    """Candidats Run archivés, ou repli boxscore si l'instantané est trop ancien."""
+    if not pred:
+        return None, None
+    home = list(pred.get('candidats_runs_home') or [])
+    away = list(pred.get('candidats_runs_away') or [])
+    if home or away:
+        return home, away
+    # Instantané d'avant l'ajout des runs : on reconstruit pour afficher la colonne.
+    return _backfill_candidats_runs_mlb(game_id)
 
 
 def classer_recommandation_totaux_over_under(total_projete, ligne):
@@ -2533,10 +2614,9 @@ def construire_bilan_veille(annee: int):
             pred.get('candidats_hr_away') if pred else None,
             hr_home, hr_away, "HR",
         )
+        cand_runs_home, cand_runs_away = _candidats_runs_bilan(pred, game_id)
         texte_run, icone_run = _bilan_joueurs_predits(
-            pred.get('candidats_runs_home') if pred else None,
-            pred.get('candidats_runs_away') if pred else None,
-            runs_home, runs_away, "Run",
+            cand_runs_home, cand_runs_away, runs_home, runs_away, "Run",
         )
 
         lignes.append({
