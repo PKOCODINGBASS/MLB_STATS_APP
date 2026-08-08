@@ -672,9 +672,11 @@ def repondre_question_hot_pronostics(
     veut_run = (not veut_hr) and any(k in q for k in (
         "run", "marquer", "scoreur", "points", "obp",
     ))
+    # Favoris / win-lose : mots explicites uniquement (évite que "probabilité"
+    # dans une question HR déclenche aussi les favoris).
     veut_victoire = any(k in q for k in (
-        "victoire", "vainqueur", "favori", "favoris", "gagner", "win", "lose", "proba",
-        "probabilite", "qui gagne",
+        "victoire", "vainqueur", "favori", "favoris", "qui gagne", "win/lose",
+        "win lose", "probabilite de victoire", "proba de victoire",
     ))
     veut_ou = any(k in q for k in (
         "over", "under", "o/u", "ou ", "total", "totaux", "ligne",
@@ -692,6 +694,12 @@ def repondre_question_hot_pronostics(
                 "- les **favoris** du jour\n"
                 "- les matchs plutôt **Over** / **Under**"
             )
+
+    # Question joueur (HR/Run) : ne pas ajouter les favoris en plus
+    if (veut_hr or veut_run) and not any(k in q for k in (
+        "favori", "favoris", "vainqueur", "qui gagne", "victoire",
+    )):
+        veut_victoire = False
 
     parties = []
 
