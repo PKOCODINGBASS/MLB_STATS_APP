@@ -2113,7 +2113,7 @@ def _formater_statut_match(status_brut: str, current_inning, inning_state: str) 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=200)
 def obtenir_scoreurs_runs_et_hr_match(game_id: int, est_domicile: bool, cache_bust: int = 0,
-                                      _cache_version: int = 2):
+                                      _cache_version: int = 3):
     """
     Récupère, via UN SEUL appel au boxscore statsapi d'un match, les runs ET les home
     runs marqués par chaque joueur d'une équipe (domicile ou extérieur).
@@ -2560,22 +2560,31 @@ def _nb_marque_joueur(pred_item, scoreurs: list) -> int:
 
 def _preds_bilan_depuis_snapshot(pred, kind: str) -> list:
     """
-    Liste des joueurs prédits pour le bilan : priorise `reco_hr` / `reco_run`
-    (top 3 Hot Pronostics figé), sinon repli sur les listes home/away legacy.
+    Liste des joueurs prédits pour le bilan : union de `reco_hr` / `reco_run`
+    (top 3 Hot Pronostics figé) et des listes home/away archivées.
     """
     if not pred:
         return []
-    recos = pred.get(f'reco_{kind}') or []
-    if recos:
-        return [r for r in recos if isinstance(r, dict) and r.get('joueur')]
-    home = pred.get(f'candidats_{kind}_home') or []
-    away = pred.get(f'candidats_{kind}_away') or []
     preds, vus = [], set()
-    for nom in list(home) + list(away):
-        if not nom or nom in vus:
-            continue
-        vus.add(nom)
-        preds.append({'joueur': nom, 'joueur_id': None})
+
+    def _ajout(item):
+        if isinstance(item, dict):
+            nom = item.get('joueur')
+            jid = item.get('joueur_id')
+        else:
+            nom, jid = item, None
+        if not nom:
+            return
+        cle_nom = str(nom).strip().lower()
+        if cle_nom in vus:
+            return
+        vus.add(cle_nom)
+        preds.append({'joueur': nom, 'joueur_id': jid})
+
+    for r in pred.get(f'reco_{kind}') or []:
+        _ajout(r)
+    for nom in list(pred.get(f'candidats_{kind}_home') or []) + list(pred.get(f'candidats_{kind}_away') or []):
+        _ajout(nom)
     return preds
 
 
@@ -2861,7 +2870,7 @@ def assembler_lignes_recap_hot_pronostics(
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def construire_bilan_veille(annee: int):
+def construire_bilan_veille(annee: int, _bilan_cache_version: int = 4):
     """
     Construit le tableau "Résultats de la veille et Bilan des Prédictions" : reprend
     la structure du tableau des matchs du jour (`construire_resume_matchs_du_jour`),
@@ -3001,6 +3010,16 @@ def afficher_bilan_predictions_veille(annee: int):
             f"({ANNEE_COURANTE})."
         )
         return
+
+    # Une fois par session après déploiement : purge les caches bilan/scoreurs
+    # (sinon un ancien DataFrame peut rester 1 h malgré le correctif noms).
+    if not st.session_state.get('_bilan_noms_fix_v4'):
+        try:
+            construire_bilan_veille.clear()
+            obtenir_scoreurs_runs_et_hr_match.clear()
+        except Exception:
+            pass
+        st.session_state['_bilan_noms_fix_v4'] = True
 
     with st.spinner("Récupération des résultats d'hier et calcul du bilan des prédictions..."):
         df_bilan, message_erreur, predictions_disponibles = construire_bilan_veille(annee)
