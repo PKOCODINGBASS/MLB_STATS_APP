@@ -349,11 +349,13 @@ def get_team_ids_dict(year: int = None):
         result[t['abbreviation']] = t['id']
     return result
 
-@st.cache_data
+@st.cache_data(show_spinner=False, ttl=1800)
 def charger_donnees_equipe(annee: int = None, equipe_abbr: str = None) -> pd.DataFrame:
     """
     Charge les données de match pour une équipe donnée (statsapi)
     Affiche deux colonnes distinctes: 'Équipe Domicile' et 'Équipe Extérieur'.
+    ttl=1800 : sans expiration le tableau "Derniers Matchs" restait figé tant que
+    l'app Streamlit Cloud restait chaude (cas observé ~1 semaine).
     """
     if annee is None:
         annee = ANNEE_COURANTE
@@ -370,7 +372,8 @@ def charger_donnees_equipe(annee: int = None, equipe_abbr: str = None) -> pd.Dat
         schedule = statsapi.schedule(team=team_id, start_date=f"{annee}-03-01", end_date=f"{annee}-11-30")
         matchs = []
         for g in schedule:
-            if g.get('status', '') != "Final":
+            statut_norm = (g.get('status') or '').strip().lower()
+            if 'final' not in statut_norm and 'game over' not in statut_norm:
                 continue
 
             home_team = g.get('home_name') or (
@@ -459,12 +462,14 @@ def charger_donnees_equipe(annee: int = None, equipe_abbr: str = None) -> pd.Dat
                 "Est_Domicile": est_dom
             })
         df = pd.DataFrame(matchs)
+        if not df.empty and 'Date' in df.columns:
+            df = df.sort_values('Date', kind='mergesort').reset_index(drop=True)
         return df
     except Exception as e:
         st.error(f"Erreur lors du chargement des données pour {equipe_abbr} ({annee}): {e}")
         return pd.DataFrame()
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=86400)
 def get_stats_offensives_match(game_id: int, est_domicile: bool):
     """
     Récupère, via le boxscore statsapi d'un match, les runs ET les home runs marqués
@@ -502,13 +507,15 @@ def get_stats_offensives_match(game_id: int, est_domicile: bool):
         return []
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=1800)
 def get_matchs_avec_scoreurs(annee: int, equipe_abbr: str):
     """
     Enrichit les données de match avec la liste des scoreurs de runs ET de home runs
     par match, et calcule le cumul de runs / home runs marqués par joueur sur toute
     la période chargée.
     Retourne (df_matchs_enrichi, df_meilleurs_scoreurs_runs, df_meilleurs_scoreurs_hr).
+    ttl=1800 pour que "Derniers Matchs" se rafraîchisse (sinon cache Streamlit
+    infini tant que l'app reste chaude).
     """
     df = charger_donnees_equipe(annee, equipe_abbr)
     if df.empty or 'game_id' not in df.columns:
@@ -3367,7 +3374,7 @@ with onglets[2]:
     st.subheader("🔝 Classement Home Runs dans l'équipe")
 
     # -------- NOUVELLE LOGIQUE : Récupérer les Home Runs via statsapi uniquement (plus de pybaseball/FanGraphs) --------
-    @st.cache_data(show_spinner=False)
+    @st.cache_data(show_spinner=False, ttl=1800)
     def get_top_hr_batteurs_statsapi(annee, equipe_abbr, top_n=3):
         """Récupère le top Home Runs via l'API officielle MLB/statsapi, pour une équipe/saison donnée."""
         result = []
