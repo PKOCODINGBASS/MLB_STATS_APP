@@ -3352,7 +3352,10 @@ with onglets[2]:
     col1, col2 = st.columns([1, 3])
 
     with col1:
-        options_equipes = [f"{abbr} - {nom}" for abbr, nom in EQUIPES_MLB.items()]
+        options_equipes = [
+            f"{abbr} - {nom}"
+            for abbr, nom in sorted(EQUIPES_MLB.items(), key=lambda x: x[1].casefold())
+        ]
         equipe_selectionnee = st.selectbox(
             "Choisissez une équipe:",
             options=options_equipes
