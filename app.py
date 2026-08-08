@@ -2112,7 +2112,8 @@ def _formater_statut_match(status_brut: str, current_inning, inning_state: str) 
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=200)
-def obtenir_scoreurs_runs_et_hr_match(game_id: int, est_domicile: bool, cache_bust: int = 0):
+def obtenir_scoreurs_runs_et_hr_match(game_id: int, est_domicile: bool, cache_bust: int = 0,
+                                      _cache_version: int = 2):
     """
     Récupère, via UN SEUL appel au boxscore statsapi d'un match, les runs ET les home
     runs marqués par chaque joueur d'une équipe (domicile ou extérieur).
@@ -2122,12 +2123,29 @@ def obtenir_scoreurs_runs_et_hr_match(game_id: int, est_domicile: bool, cache_bu
     l'onglet "Analyse par Équipe" et jamais invalidée) car ici le match peut être EN
     COURS : `cache_bust` change la clé de cache Streamlit à la demande. `ttl=3600`
     reste un filet de sécurité pour éviter une croissance illimitée du cache.
+    `_cache_version` invalide le cache après correctif des noms fullName.
     """
     if not game_id:
         return [], []
     try:
         box = appeler_avec_retry(statsapi.boxscore_data, int(game_id))
         batters = box.get('homeBatters', []) if est_domicile else box.get('awayBatters', [])
+        # Les batters exposent `name` au format "Last, F" (ex: "De La Cruz, E"),
+        # incompatible avec les fullName lineup ("Elly De La Cruz"). On mappe donc
+        # personId -> fullName via le bloc players du boxscore.
+        noms_complets = {}
+        for side in ('home', 'away'):
+            for _cle, p in ((box.get(side) or {}).get('players') or {}).items():
+                person = (p or {}).get('person') or {}
+                pid_p = person.get('id')
+                full = person.get('fullName')
+                if pid_p is None or not full:
+                    continue
+                try:
+                    noms_complets[int(pid_p)] = full
+                except (TypeError, ValueError):
+                    continue
+
         runs_par_joueur = {}  # personId -> (nom, nb)
         hr_par_joueur = {}
         for b in batters:
@@ -2138,7 +2156,7 @@ def obtenir_scoreurs_runs_et_hr_match(game_id: int, est_domicile: bool, cache_bu
                 pid = int(pid)
             except (TypeError, ValueError):
                 continue
-            nom = b.get('name', 'Inconnu')
+            nom = noms_complets.get(pid) or _normaliser_nom_boxscore_mlb(b.get('name')) or 'Inconnu'
             try:
                 runs = int(b.get('r', 0) or 0)
             except (ValueError, TypeError):
@@ -2443,10 +2461,35 @@ def _bilan_over_under(total_runs_predit, total_runs_reel: int, ligne: float):
     ), icone
 
 
+def _normaliser_nom_boxscore_mlb(nom: str) -> str:
+    """
+    Convertit un nom boxscore MLB "Last, F" / "De La Cruz, E" en forme comparable
+    ("E De La Cruz"), ou renvoie le nom nettoyé s'il n'est pas dans ce format.
+    """
+    texte = (nom or '').strip()
+    if not texte:
+        return ''
+    if ',' in texte:
+        partie_nom, partie_prenom = texte.split(',', 1)
+        partie_nom = partie_nom.strip()
+        partie_prenom = partie_prenom.strip().rstrip('.')
+        if partie_nom and partie_prenom:
+            return f"{partie_prenom} {partie_nom}".strip()
+        return partie_nom or partie_prenom
+    return texte
+
+
+def _cle_nom_joueur(texte: str) -> str:
+    """Clé de comparaison : minuscules, sans accents/ponctuation, espaces normalisés."""
+    brut = _normaliser_nom_equipe(texte or '')
+    brut = re.sub(r'[^a-z0-9\s]', ' ', brut)
+    return ' '.join(brut.split())
+
+
 def _noms_joueurs_correspondent(nom_predit: str, nom_reel: str) -> bool:
     """Correspondance assouplie entre un nom archivé (lineup) et un nom boxscore."""
-    pred = _normaliser_nom_equipe(nom_predit)
-    reel = _normaliser_nom_equipe(nom_reel)
+    pred = _cle_nom_joueur(_normaliser_nom_boxscore_mlb(nom_predit))
+    reel = _cle_nom_joueur(_normaliser_nom_boxscore_mlb(nom_reel))
     if not pred or not reel:
         return False
     # Retire suffixes Jr/Sr/II/III fréquents en MLB
@@ -2457,12 +2500,18 @@ def _noms_joueurs_correspondent(nom_predit: str, nom_reel: str) -> bool:
             reel = reel[: -len(suffixe)].strip()
     if pred == reel or pred in reel or reel in pred:
         return True
+    # Sans espaces : "ellydelacruz" vs "edelacruz" / "delacruz"
+    pred_ns, reel_ns = pred.replace(' ', ''), reel.replace(' ', '')
+    if pred_ns == reel_ns or (len(reel_ns) > 4 and reel_ns in pred_ns) or (len(pred_ns) > 4 and pred_ns in reel_ns):
+        return True
     pred_parts, reel_parts = pred.split(), reel.split()
     if not pred_parts or not reel_parts:
         return False
-    # "Francisco Lindor" vs "Lindor" / "F. Lindor"
-    if pred_parts[-1] == reel_parts[-1] and len(pred_parts[-1]) > 2:
-        return True
+    # Noms composés type "de la cruz" : compare les 2-3 derniers tokens
+    for n in (3, 2, 1):
+        if len(pred_parts) >= n and len(reel_parts) >= n:
+            if pred_parts[-n:] == reel_parts[-n:] and len(pred_parts[-1]) > 2:
+                return True
     if len(pred_parts) == 1 and pred_parts[0] == reel_parts[-1] and len(pred_parts[0]) > 2:
         return True
     if len(reel_parts) == 1 and reel_parts[0] == pred_parts[-1] and len(reel_parts[0]) > 2:
