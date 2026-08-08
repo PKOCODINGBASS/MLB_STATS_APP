@@ -52,6 +52,7 @@ render_section_title = _ps_theme.render_section_title
 afficher_cartes_matchs = _ps_theme.afficher_cartes_matchs
 afficher_badge_value_bet = _ps_theme.afficher_badge_value_bet
 afficher_tableau_recap_hot_pronostics = _ps_theme.afficher_tableau_recap_hot_pronostics
+afficher_assistant_hot_pronostics = _ps_theme.afficher_assistant_hot_pronostics
 afficher_outil_coherence_totaux = _ps_theme.afficher_outil_coherence_totaux
 render_footer = _ps_theme.render_footer
 render_prediction_match_banner = _ps_theme.render_prediction_match_banner
@@ -3263,6 +3264,11 @@ with onglets[1]:
                     "forme récente des joueurs. Ce ne sont pas des garanties de résultat : simples "
                     "heuristiques, à utiliser uniquement à titre informatif, avec discernement si vous "
                     "vous en servez pour parier."
+                )
+
+                st.markdown("---")
+                afficher_assistant_hot_pronostics(
+                    df_hr_all, df_runs_all, df_victoires, lignes_recap, key_prefix="mlb_hot"
                 )
 
                 nb_matchs_avec_lineup = sum(1 for m in matchs_jour if m['home_lineup'] or m['away_lineup'])

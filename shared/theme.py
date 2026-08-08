@@ -10,6 +10,8 @@ Usage dans chaque app (après `st.set_page_config`) :
 from __future__ import annotations
 
 import html
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -599,6 +601,276 @@ def afficher_tableau_recap_hot_pronostics(
             st.markdown(f"**{label_secondary} :** {reco_run}")
             if row.get("reco_run_detail"):
                 st.caption(str(row["reco_run_detail"]))
+
+
+def _extraire_n_question_hot(question: str, defaut: int = 3) -> int:
+    """Extrait un top-N depuis une question en français (chiffres ou lettres)."""
+    q = (question or "").lower()
+    # Typo fréquente : "rois" pour "trois"
+    q = q.replace("rois joueurs", "trois joueurs").replace("rois ", "trois ")
+    m = re.search(r"\btop\s*(\d{1,2})\b", q)
+    if m:
+        return max(1, min(10, int(m.group(1))))
+    m = re.search(r"\b(\d{1,2})\s*(?:joueurs?|meilleurs?|favoris?|candidats?)\b", q)
+    if m:
+        return max(1, min(10, int(m.group(1))))
+    mots = {
+        "un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5,
+        "six": 6, "sept": 7, "huit": 8, "neuf": 9, "dix": 10,
+    }
+    for mot, n in mots.items():
+        if re.search(rf"\b{mot}\b", q):
+            return n
+    return defaut
+
+
+def _normaliser_texte_question(texte: str) -> str:
+    brut = unicodedata.normalize("NFKD", texte or "")
+    brut = "".join(c for c in brut if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", brut.lower()).strip()
+
+
+def repondre_question_hot_pronostics(
+    question: str,
+    df_hr_all,
+    df_runs_all,
+    df_victoires,
+    lignes_recap: list | None = None,
+) -> str:
+    """
+    Répond à une question libre à partir des tableaux Hot Pronostics déjà calculés.
+    Pas de LLM : intention détectée par mots-clés (HR / Run / favoris / O-U).
+    Ne modifie aucun algorithme de prédiction — lecture seule des DataFrames.
+    """
+    q_raw = (question or "").strip()
+    if not q_raw:
+        return "Écris une question, par exemple : « Donne-moi les 3 joueurs les plus susceptibles de marquer un HR »."
+
+    q = _normaliser_texte_question(q_raw)
+    n = _extraire_n_question_hot(q_raw, defaut=3)
+
+    # Filtre équipe optionnel (si un nom d'équipe du jour apparaît dans la question)
+    equipes = set()
+    for df in (df_hr_all, df_runs_all):
+        if df is not None and hasattr(df, "empty") and not df.empty and "Équipe" in df.columns:
+            equipes.update(str(x) for x in df["Équipe"].dropna().unique())
+    if df_victoires is not None and hasattr(df_victoires, "empty") and not df_victoires.empty:
+        for col in ("Équipe Domicile", "Équipe Extérieur"):
+            if col in df_victoires.columns:
+                equipes.update(str(x) for x in df_victoires[col].dropna().unique())
+
+    equipe_filtre = None
+    for nom in sorted(equipes, key=len, reverse=True):
+        if _normaliser_texte_question(nom) and _normaliser_texte_question(nom) in q:
+            equipe_filtre = nom
+            break
+
+    veut_hr = any(k in q for k in (
+        "hr", "home run", "homerun", "circuit", "slugger", "coups de circuit", "coup de circuit",
+    ))
+    # "marquer" seul penche runs, sauf si HR déjà détecté
+    veut_run = (not veut_hr) and any(k in q for k in (
+        "run", "marquer", "scoreur", "points", "obp",
+    ))
+    veut_victoire = any(k in q for k in (
+        "victoire", "vainqueur", "favori", "favoris", "gagner", "win", "lose", "proba",
+        "probabilite", "qui gagne",
+    ))
+    veut_ou = any(k in q for k in (
+        "over", "under", "o/u", "ou ", "total", "totaux", "ligne",
+    ))
+
+    # Si rien de clair : défaut HR (cas le plus demandé)
+    if not any((veut_hr, veut_run, veut_victoire, veut_ou)):
+        if "joueur" in q or "probab" in q or "susceptible" in q:
+            veut_hr = True
+        else:
+            return (
+                "Je n'ai pas bien cerné la question. Tu peux demander par exemple :\n"
+                "- les 3 joueurs les plus susceptibles de marquer un **HR**\n"
+                "- les 5 meilleurs candidats **runs**\n"
+                "- les **favoris** du jour\n"
+                "- les matchs plutôt **Over** / **Under**"
+            )
+
+    parties = []
+
+    if veut_hr:
+        df = df_hr_all
+        if df is None or getattr(df, "empty", True):
+            parties.append("Aucun candidat HR disponible pour le moment (lineups souvent absentes tôt dans la journée).")
+        else:
+            sous = df
+            if equipe_filtre and "Équipe" in sous.columns:
+                sous = sous[sous["Équipe"].astype(str) == equipe_filtre]
+            sous = sous.head(n)
+            if sous.empty:
+                parties.append(f"Aucun candidat HR trouvé pour {equipe_filtre}." if equipe_filtre else "Aucun candidat HR.")
+            else:
+                titre = f"**Top {len(sous)} HR**"
+                if equipe_filtre:
+                    titre += f" — {equipe_filtre}"
+                lignes = [titre + " (indice Hot Pronostics du jour) :"]
+                for i in range(len(sous)):
+                    row = sous.iloc[i]
+                    try:
+                        indice_txt = f"{float(row.get('Indice HR (/100)')):.0f}/100"
+                    except (TypeError, ValueError):
+                        indice_txt = "—"
+                    lignes.append(
+                        f"{i + 1}. **{row.get('Joueur', '?')}** "
+                        f"({row.get('Équipe', '?')} vs {row.get('Adversaire', '?')}) — indice {indice_txt}"
+                    )
+                parties.append("\n".join(lignes))
+
+    if veut_run:
+        df = df_runs_all
+        if df is None or getattr(df, "empty", True):
+            parties.append("Aucun candidat Run disponible pour le moment.")
+        else:
+            sous = df
+            if equipe_filtre and "Équipe" in sous.columns:
+                sous = sous[sous["Équipe"].astype(str) == equipe_filtre]
+            sous = sous.head(n)
+            if sous.empty:
+                parties.append(f"Aucun candidat Run trouvé pour {equipe_filtre}." if equipe_filtre else "Aucun candidat Run.")
+            else:
+                titre = f"**Top {len(sous)} Runs**"
+                if equipe_filtre:
+                    titre += f" — {equipe_filtre}"
+                lignes = [titre + " (indice Hot Pronostics du jour) :"]
+                for i in range(len(sous)):
+                    row = sous.iloc[i]
+                    try:
+                        indice_txt = f"{float(row.get('Indice Run (/100)')):.0f}/100"
+                    except (TypeError, ValueError):
+                        indice_txt = "—"
+                    lignes.append(
+                        f"{i + 1}. **{row.get('Joueur', '?')}** "
+                        f"({row.get('Équipe', '?')} vs {row.get('Adversaire', '?')}) — indice {indice_txt}"
+                    )
+                parties.append("\n".join(lignes))
+
+    if veut_victoire:
+        df = df_victoires
+        if df is None or getattr(df, "empty", True):
+            parties.append("Aucune probabilité de victoire disponible.")
+        else:
+            favoris = []
+            for _, row in df.iterrows():
+                home = row.get("Équipe Domicile")
+                away = row.get("Équipe Extérieur")
+                ph = row.get("Proba Domicile (%)")
+                pa = row.get("Proba Extérieur (%)")
+                try:
+                    ph_f, pa_f = float(ph), float(pa)
+                except (TypeError, ValueError):
+                    continue
+                if equipe_filtre and equipe_filtre not in (home, away):
+                    continue
+                if ph_f >= pa_f:
+                    favoris.append((ph_f, home, away, ph_f, "domicile"))
+                else:
+                    favoris.append((pa_f, away, home, pa_f, "extérieur"))
+            favoris.sort(key=lambda x: x[0], reverse=True)
+            favoris = favoris[:n]
+            if not favoris:
+                parties.append("Aucun favori trouvé pour ce filtre.")
+            else:
+                lignes = [f"**Top {len(favoris)} favoris** du jour :"]
+                for i, (pct, fav, adv, _, cote) in enumerate(favoris, 1):
+                    lignes.append(f"{i}. **{fav}** ({pct:.1f}%) vs {adv} — côté {cote}")
+                parties.append("\n".join(lignes))
+
+    if veut_ou and lignes_recap:
+        overs, unders, nobet = [], [], []
+        for row in lignes_recap:
+            kind = (row.get("ou_kind") or "").upper()
+            conf = row.get("confrontation") or "?"
+            resume = row.get("ou_resume") or ""
+            if equipe_filtre:
+                conf_n = _normaliser_texte_question(str(conf))
+                if _normaliser_texte_question(equipe_filtre) not in conf_n:
+                    continue
+            item = f"**{conf}** — {resume}" if resume else f"**{conf}**"
+            if kind == "OVER":
+                overs.append(item)
+            elif kind == "UNDER":
+                unders.append(item)
+            else:
+                nobet.append(item)
+        blocs = ["**Totaux (O/U)** du tableau de bord :"]
+        if overs:
+            blocs.append("🟢 Over :\n- " + "\n- ".join(overs[:n]))
+        if unders:
+            blocs.append("🟢 Under :\n- " + "\n- ".join(unders[:n]))
+        if not overs and not unders:
+            blocs.append("Pas de signal Over/Under clair (NO BET) sur les matchs filtrés.")
+            if nobet:
+                blocs.append("- " + "\n- ".join(nobet[:n]))
+        parties.append("\n\n".join(blocs))
+    elif veut_ou:
+        parties.append("Les totaux O/U ne sont pas chargés pour cette question.")
+
+    parties.append(
+        "\n_Réponse basée uniquement sur les indices Hot Pronostics du jour "
+        "(heuristiques, pas une garantie de résultat)._"
+    )
+    return "\n\n".join(parties)
+
+
+def afficher_assistant_hot_pronostics(
+    df_hr_all,
+    df_runs_all,
+    df_victoires,
+    lignes_recap: list | None = None,
+    *,
+    key_prefix: str = "hot",
+) -> None:
+    """
+    Boîte de question dans l'onglet Hot Pronostics.
+    L'utilisateur pose une question en français ; la réponse lit les DataFrames du jour.
+    """
+    st.subheader("💬 Pose une question")
+    st.caption(
+        "Exemples : « Donne-moi les 3 joueurs les plus susceptibles de marquer un HR », "
+        "« Qui a le plus de chances de marquer un run ? », « Quels sont les favoris du jour ? »."
+    )
+
+    input_key = f"{key_prefix}_input_question"
+    exemples = [
+        "Donne-moi les 3 joueurs les plus susceptibles de marquer un HR",
+        "Quels sont les 5 meilleurs candidats pour marquer un run ?",
+        "Quels sont les favoris du jour ?",
+        "Quels matchs sont plutôt Over ?",
+    ]
+    cols = st.columns(2)
+    for i, ex in enumerate(exemples):
+        with cols[i % 2]:
+            if st.button(ex, key=f"{key_prefix}_ex_{i}", use_container_width=True):
+                st.session_state[input_key] = ex
+                st.session_state[f"{key_prefix}_question"] = ex
+                st.session_state[f"{key_prefix}_auto"] = True
+
+    question = st.text_input(
+        "Ta question",
+        placeholder="Ex. : Donne-moi les 3 joueurs susceptibles de marquer des HR…",
+        key=input_key,
+    )
+    envoyer = st.button("Obtenir la réponse", type="primary", key=f"{key_prefix}_btn_send")
+
+    if envoyer and question:
+        st.session_state[f"{key_prefix}_question"] = question
+        st.session_state[f"{key_prefix}_auto"] = True
+
+    q = st.session_state.get(f"{key_prefix}_question") or question
+    if st.session_state.get(f"{key_prefix}_auto") and q:
+        with st.container(border=True):
+            st.markdown(
+                repondre_question_hot_pronostics(
+                    q, df_hr_all, df_runs_all, df_victoires, lignes_recap
+                )
+            )
 
 
 def ensure_shared_on_path(app_file: str) -> None:
